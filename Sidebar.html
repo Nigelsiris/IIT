@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 0;
+        padding: 12px;
+        color: #202124;
+      }
+
+      h2 {
+        margin: 0 0 12px;
+        font-size: 18px;
+      }
+
+      .card {
+        border: 1px solid #dadce0;
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+
+      .row {
+        display: flex;
+        gap: 8px;
+      }
+
+      .col {
+        flex: 1;
+      }
+
+      label {
+        display: block;
+        font-size: 12px;
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+
+      input,
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid #dadce0;
+        border-radius: 6px;
+        padding: 8px;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+
+      textarea {
+        min-height: 64px;
+        resize: vertical;
+      }
+
+      button {
+        border: 1px solid #1a73e8;
+        background: #1a73e8;
+        color: #fff;
+        border-radius: 6px;
+        font-size: 12px;
+        padding: 8px 10px;
+        cursor: pointer;
+        margin-right: 6px;
+        margin-bottom: 6px;
+      }
+
+      button.secondary {
+        background: #fff;
+        color: #1a73e8;
+      }
+
+      #status {
+        font-size: 12px;
+        margin-top: 6px;
+        white-space: pre-wrap;
+      }
+
+      #status.error {
+        color: #b00020;
+      }
+
+      #status.ok {
+        color: #0b8043;
+      }
+
+      .hint {
+        font-size: 11px;
+        color: #5f6368;
+        margin: -4px 0 8px;
+      }
+
+      pre {
+        background: #f8f9fa;
+        border-radius: 6px;
+        border: 1px solid #eee;
+        padding: 8px;
+        font-size: 11px;
+        white-space: pre-wrap;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Inbound Invoicing Tool</h2>
+
+    <div class="card">
+      <label for="searchQuery">Gmail Search Query</label>
+      <input id="searchQuery" type="text" />
+
+      <label for="sourceFolders">Drive Source Folder IDs (comma or new line)</label>
+      <textarea id="sourceFolders"></textarea>
+      <div class="hint">Used for folder-based invoice intake.</div>
+
+      <label for="processedFolderId">Processed Folder ID</label>
+      <input id="processedFolderId" type="text" />
+      <div class="hint">Finalized invoices are sorted into carrier subfolders here.</div>
+
+      <label for="carrierTypeFixes">Carrier Type Auto-Fixes</label>
+      <textarea id="carrierTypeFixes" placeholder="DM trans => Arrive"></textarea>
+      <div class="hint">One rule per line. Use <code>from =&gt; to</code> or <code>from = to</code>.</div>
+      <label for="confirmedCarriers">Confirmed Carriers</label>
+      <textarea id="confirmedCarriers" placeholder="Arrive&#10;Estes&#10;FedEx"></textarea>
+      <div class="hint">One carrier per line. Unrecognized carriers are held for manual review. Leave blank to allow all.</div>
+      <div class="row">
+        <div class="col">
+          <label for="targetEmail">Target Email</label>
+          <input id="targetEmail" type="email" />
+        </div>
+        <div class="col">
+          <label for="runIntervalMinutes">Trigger Interval (minutes)</label>
+          <input id="runIntervalMinutes" type="number" min="1" />
+        </div>
+      </div>
+
+      <label for="sheetId">Sheet ID</label>
+      <input id="sheetId" type="text" />
+
+      <label for="sheetName">Sheet Name</label>
+      <input id="sheetName" type="text" />
+
+      <button onclick="saveConfig()">Save Configuration</button>
+      <button class="secondary" onclick="initializeDefaults()">Initialize Defaults</button>
+    </div>
+
+    <div class="card">
+      <button onclick="runAction('uiRunDriveProcessing')">Run Drive Now</button>
+      <button onclick="runAction('uiRunAllProcessing')">Run All Now</button>
+      <button class="secondary" onclick="runAction('uiCreateTriggers')">Create / Reset Triggers</button>
+      <button class="secondary" onclick="runAction('uiCleanupProcessedState')">Cleanup Processed State</button>
+      <div class="hint">Folder-only mode enabled. Gmail ingestion is disabled.</div>
+      <div id="status"></div>
+    </div>
+
+    <div class="card">
+      <label>Last Run Summary</label>
+      <pre id="lastRun">No run history yet.</pre>
+    </div>
+
+    <script>
+      function getValue(id) {
+        return document.getElementById(id).value || '';
+      }
+
+      function setValue(id, value) {
+        document.getElementById(id).value = value || '';
+      }
+
+      function setStatus(message, isError) {
+        const node = document.getElementById('status');
+        node.textContent = message;
+        node.className = isError ? 'error' : 'ok';
+      }
+
+      function showLastRun(lastRun) {
+        const node = document.getElementById('lastRun');
+        if (!lastRun) {
+          node.textContent = 'No run history yet.';
+          return;
+        }
+        node.textContent = JSON.stringify(lastRun, null, 2);
+      }
+
+      function renderConfig(config) {
+        setValue('searchQuery', config.searchQuery);
+        setValue('sourceFolders', config.sourceFolders);
+        setValue('processedFolderId', config.processedFolderId);
+        setValue('carrierTypeFixes', config.carrierTypeFixes);
+        setValue('confirmedCarriers', config.confirmedCarriers || '');
+        setValue('targetEmail', config.targetEmail);
+        setValue('sheetId', config.sheetId);
+        setValue('sheetName', config.sheetName);
+        setValue('runIntervalMinutes', config.runIntervalMinutes);
+        showLastRun(config.lastRun);
+      }
+
+      function loadConfig() {
+        google.script.run
+          .withSuccessHandler(renderConfig)
+          .withFailureHandler(err => setStatus(err.message || String(err), true))
+          .getUiConfig();
+      }
+
+      function saveConfig() {
+        const payload = {
+          searchQuery: getValue('searchQuery'),
+          sourceFolders: getValue('sourceFolders'),
+          processedFolderId: getValue('processedFolderId'),
+          carrierTypeFixes: getValue('carrierTypeFixes'),
+          confirmedCarriers: getValue('confirmedCarriers'),
+          targetEmail: getValue('targetEmail'),
+          sheetId: getValue('sheetId'),
+          sheetName: getValue('sheetName'),
+          runIntervalMinutes: getValue('runIntervalMinutes')
+        };
+
+        setStatus('Saving configuration...', false);
+        google.script.run
+          .withSuccessHandler(result => {
+            setStatus(result.message || 'Configuration saved.', false);
+            renderConfig(result.config);
+          })
+          .withFailureHandler(err => setStatus(err.message || String(err), true))
+          .saveUiConfig(payload);
+      }
+
+      function initializeDefaults() {
+        setStatus('Initializing default properties...', false);
+        google.script.run
+          .withSuccessHandler(result => {
+            setStatus(result.message, false);
+            renderConfig(result.config);
+          })
+          .withFailureHandler(err => setStatus(err.message || String(err), true))
+          .initializeScriptProperties();
+      }
+
+      function runAction(actionName) {
+        setStatus('Running action...', false);
+        google.script.run
+          .withSuccessHandler(result => {
+            if (!result.ok) {
+              setStatus(result.error || 'Action failed.', true);
+              showLastRun(result.lastRun);
+              return;
+            }
+
+            const text = typeof result.result === 'string'
+              ? result.result
+              : JSON.stringify(result.result, null, 2);
+            setStatus(`Action complete:\n${text}`, false);
+            showLastRun(result.lastRun);
+          })
+          .withFailureHandler(err => setStatus(err.message || String(err), true))[actionName]();
+      }
+
+      loadConfig();
+    </script>
+  </body>
+</html>
