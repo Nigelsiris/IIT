@@ -44,15 +44,14 @@ function mountPipeline(ocrText, options) {
     })
   };
   S.LockService = { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) };
-  S.Drive = { Files: { create: () => ({ id: 'temp-doc-id' }) } };
+  S.Drive = {
+    Files: {
+      create: () => ({ id: 'temp-doc-id', mimeType: 'application/vnd.google-apps.spreadsheet' }),
+      get: () => ({ mimeType: 'application/vnd.google-apps.spreadsheet' })
+    }
+  };
   S.DriveApp = { getFileById: () => ({ setTrashed() {} }) };
   S.DocumentApp = { openById: () => ({ getBody: () => ({ getText: () => ocrText }) }) };
-  S.SpreadsheetApp = {
-    openById: () => ({
-      getSheetByName: () => sheet,
-      insertSheet: () => sheet
-    })
-  };
   S.MailApp = { sendEmail: message => emails.push(message) };
 
   const sheet = {
@@ -61,6 +60,56 @@ function mountPipeline(ocrText, options) {
     getRange: () => ({ getValues: () => [S.LOG_HEADERS.slice()], setValues() {} }),
     appendRow: row => appendedRows.push(row)
   };
+
+  // Enough SpreadsheetApp surface for the sheets-based merge to run: it builds a
+  // master spreadsheet, copies the converted original into it and exports once.
+  const mergeRange = {
+    setValues() { return mergeRange; },
+    merge() { return mergeRange; },
+    setBackground() { return mergeRange; },
+    setFontColor() { return mergeRange; },
+    setFontSize() { return mergeRange; },
+    setFontWeight() { return mergeRange; },
+    setHorizontalAlignment() { return mergeRange; },
+    setWrap() { return mergeRange; },
+    setBorder() { return mergeRange; },
+    getValues: () => [S.LOG_HEADERS.slice()]
+  };
+  const mergeSheet = {
+    setName() {},
+    getName: () => 'Coded Summary',
+    getRange: () => mergeRange,
+    setColumnWidth() {},
+    copyTo() {}
+  };
+  const mergeSpreadsheet = {
+    getActiveSheet: () => mergeSheet,
+    getSheets: () => [mergeSheet],
+    getSheetByName: name => (name === opts.logSheetName ? sheet : null),
+    deleteSheet() {}
+  };
+  S.SpreadsheetApp = {
+    BorderStyle: { SOLID: 'SOLID' },
+    flush() {},
+    openById: id => (id === 'sheet-id'
+      ? { getSheetByName: () => sheet, insertSheet: () => sheet }
+      : mergeSpreadsheet)
+  };
+  S.ScriptApp = { getOAuthToken: () => 'token' };
+  S.UrlFetchApp = {
+    fetch: () => ({
+      getResponseCode: () => (opts.breakMerge ? 500 : 200),
+      getBlob: () => S.Utilities.newBlob('merged-pdf-bytes', 'application/pdf', 'merged.pdf')
+    })
+  };
+  S.Session = { getEffectiveUser: () => ({ getEmail: () => 'owner@lidl.us' }), getScriptTimeZone: () => 'UTC' };
+
+  const sentMail = [];
+  S.GmailApp = {
+    sendEmail: (to, subject, body, options) => sentMail.push({ to, subject, body, options }),
+    getAliases: () => (opts.aliases || [])
+  };
+  S.clearSendAsAliasCache();
 
   // getInvoiceSheet memoizes on SHEET_ID::SHEET_NAME and that cache lives in
   // code.js's own scope, so give every mount a distinct name to force a fresh
@@ -71,9 +120,12 @@ function mountPipeline(ocrText, options) {
     TARGET_EMAIL: 'ap@example.com',
     PROCESSED_FOLDER_ID: 'processed-id',
     SOURCE_FOLDERS: ['source-id'],
+    SEND_AS_ALIAS: opts.sendAsAlias === undefined ? 'logistics.invoices@lidl.us' : opts.sendAsAlias,
+    SEND_AS_NAME: 'Inbound Invoicing',
     // getConfig() stores this as a Set of lowercased names.
     CONFIRMED_CARRIERS: S.parseConfirmedCarriers((opts.confirmedCarriers || []).join('\n'))
   };
+  opts.logSheetName = config.SHEET_NAME;
 
   const blob = S.Utilities.newBlob('pdf', 'application/pdf', opts.fileName || 'invoice.pdf');
   const result = S.processInvoiceFile(
@@ -83,14 +135,14 @@ function mountPipeline(ocrText, options) {
     'drive|test|' + (opts.key || Math.random()),
     config,
     'application/pdf',
-    { sendEmail: opts.sendEmail !== false }
+    { sendEmail: opts.sendEmail !== false, fileId: 'drive-file-' + (opts.key || 'x') }
   );
 
   const reviewItems = Object.keys(store)
     .filter(key => key.indexOf(S.REVIEW_PREFIX) === 0)
     .map(key => JSON.parse(store[key]));
 
-  return { result, appendedRows, emails, reviewItems, store, config };
+  return { result, appendedRows, emails: sentMail, reviewItems, store, config };
 }
 
 const fixture = name => fs.readFileSync(path.join(__dirname, 'fixtures', name), 'utf8');
@@ -100,6 +152,7 @@ group('confirmed carrier, confident amount', () => {
   const run = mountPipeline(fixture('arrive-INV6737123.txt'), {
     fileName: 'invoice-INV6737123.pdf',
     confirmedCarriers: ['Arrive Logistics'],
+    aliases: ['logistics.invoices@lidl.us'],
     key: 'clean'
   });
 
@@ -117,11 +170,23 @@ group('confirmed carrier, confident amount', () => {
   // The Amount column must be a real number so SUM works over the sheet.
   check('amount logged as number', row[7], 1150);
   check('coding logged', row[12], '360100, 50001, CAT 1');
-  check('email sent', run.emails.length, 1);
+
+  check('one email sent', run.emails.length, 1);
+  const mail = run.emails[0];
+  // Sent AS the delegated mailbox, TO the AP address — not owner-to-owner.
+  check('sent to AP', mail.to, 'ap@example.com');
+  check('sent as the delegated mailbox', mail.options.from, 'logistics.invoices@lidl.us');
+  // One merged document, not a code sheet plus a loose original.
+  check('single merged attachment', mail.options.attachments.length, 1);
+  check('merged attachment name', mail.options.attachments[0].getName(), 'Coded_invoice-INV6737123.pdf');
+  check('subject not flagged', mail.subject, 'Processed Invoice: invoice-INV6737123.pdf');
+
+  // The pair still goes to Drive so the carrier merge job can find it.
+  check('pair written to Drive', run.result.outputBlobs.length, 2);
 });
 
-/* ─── an amount we cannot justify is held, not logged ─────────────────────── */
-group('low-confidence amount is held', () => {
+/* ─── a shaky amount still ships, as long as the coding resolved ──────────── */
+group('low-confidence amount still sends', () => {
   const vague = [
     'Speedy Freight LLC',
     '100 Depot Road',
@@ -136,19 +201,84 @@ group('low-confidence amount is held', () => {
   const run = mountPipeline(vague, {
     fileName: 'SF-88213.pdf',
     confirmedCarriers: ['Speedy Freight LLC'],
+    aliases: ['logistics.invoices@lidl.us'],
     key: 'vague'
   });
 
+  // Perryville resolves to RDC 70001, so the coding is good and it ships.
+  check('processed, not held', run.result.status, 'processed');
+  check('logged', run.appendedRows.length, 1);
+  check('coding resolved', run.appendedRows[0][12], '360100, 70001, CAT 4');
+  check('amount still logged', run.appendedRows[0][7], 1234.56);
+  check('nothing queued', run.reviewItems.length, 0);
+
+  // ...but the uncertainty is impossible to miss.
+  check('email sent', run.emails.length, 1);
+  check('subject flags the amount', run.emails[0].subject.indexOf('[CHECK AMOUNT]'), 0);
+  check('body explains', run.emails[0].body.indexOf('could not be tied to an') > -1, true);
+});
+
+/* ─── no RDC means a person has to decide ─────────────────────────────────── */
+group('unresolved coding is held', () => {
+  const noRdc = [
+    'Speedy Freight LLC',
+    'Invoice # SF-99001',
+    'Ship Date 3/18/2026',
+    'Amount Due $2,000.00'
+  ].join('\n');
+
+  const run = mountPipeline(noRdc, {
+    fileName: 'SF-99001.pdf',
+    confirmedCarriers: ['Speedy Freight LLC'],
+    key: 'nordc'
+  });
+
   check('held for review', run.result.status, 'held_for_review');
-  check('reason is the amount', run.result.heldReason, 'low_confidence_amount');
+  check('reason is the coding', run.result.heldReason, 'unresolved_coding');
   check('nothing written to the sheet', run.appendedRows.length, 0);
   check('no email sent', run.emails.length, 0);
   check('queued once', run.reviewItems.length, 1);
-  check('amount carried into review', run.reviewItems[0].extractedData.amount, '1234.56');
-  check('confidence carried into review', run.reviewItems[0].extractedData.amountConfidence, 'low');
+  // The held item must remember the Drive file, or approving it later loses
+  // the original and emails a lone code sheet.
+  check('source file remembered', run.reviewItems[0].fileId, 'drive-file-nordc');
 });
 
-/* ─── an unconfirmed carrier is held before the amount is even considered ─── */
+/* ─── the merge degrades gracefully ───────────────────────────────────────── */
+group('merge failure falls back to both files', () => {
+  const run = mountPipeline(fixture('arrive-INV6744248.txt'), {
+    fileName: 'invoice-INV6744248.pdf',
+    confirmedCarriers: ['Arrive Logistics'],
+    aliases: ['logistics.invoices@lidl.us'],
+    key: 'mergefail',
+    breakMerge: true
+  });
+
+  check('still processed', run.result.status, 'processed');
+  check('email still sent', run.emails.length, 1);
+  // Two attachments rather than nothing at all.
+  check('fell back to the pair', run.emails[0].options.attachments.length, 2);
+});
+
+/* ─── an unusable alias is reported, not silently ignored ─────────────────── */
+group('send-as alias validation', () => {
+  const run = mountPipeline(fixture('arrive-INV6737123.txt'), {
+    fileName: 'invoice-INV6737123.pdf',
+    confirmedCarriers: ['Arrive Logistics'],
+    aliases: [],
+    key: 'noalias'
+  });
+
+  check('still sent', run.emails.length, 1);
+  // No verified alias: Gmail would ignore `from`, so it is left off entirely.
+  check('from omitted', run.emails[0].options.from, undefined);
+
+  const warned = S.getProcessingFeed(50).some(function(entry) {
+    return entry.type === 'warning' && entry.message.indexOf('Sending as the account owner') >= 0;
+  });
+  check('warned about the alias', warned, true);
+});
+
+/* ─── an unconfirmed carrier is held before anything else ─────────────────── */
 group('unconfirmed carrier is held', () => {
   const run = mountPipeline(fixture('arrive-INV6744248.txt'), {
     fileName: 'invoice-INV6744248.pdf',

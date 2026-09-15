@@ -11,10 +11,10 @@ Google Apps Script automation for inbound freight invoices — PDFs, Excel workb
 - Separates inbound from outbound mail forwarded by a delegated mailbox, by reading the original sender/subject out of the forward
 - Applies routing/coding rules
 - Logs to a Google Sheet
-- Sends an email with original PDF + generated coded summary PDF
 - Reads spreadsheet invoices as data, including workbooks holding **many invoices, one per line**
 - Reconciles spreadsheet line items against the total the workbook declares
-- Holds invoices whose amount cannot be tied to an explicit label for manual review
+- Flags invoices whose amount cannot be tied to an explicit label, and holds ones whose RDC coding could not be determined
+- Emails the coded summary merged with the original invoice as a single PDF, sent as the delegated mailbox
 - Prevents duplicate processing with idempotent processing state
 - Uploads invoices directly from the web app into source folders
 - Shows real-time processing activity feed in the web app
@@ -31,7 +31,8 @@ Default folder IDs:
 4. Fill in and save:
 	- `SOURCE_FOLDER_IDS` (comma/newline-separated)
 	- `PROCESSED_FOLDER_ID`
-	- `TARGET_EMAIL`
+	- `TARGET_EMAIL` (AP address)
+	- `SEND_AS_ALIAS` (delegated mailbox to send as)
 	- `SHEET_ID`
 	- `SHEET_NAME` (defaults to `Invoice Logger`)
 	- `RUN_INTERVAL_MINUTES` (defaults to `15`)
@@ -86,6 +87,36 @@ cells are reported instead of quietly counting as zero. If the line items do not
 match the total the workbook declares, the file is held for review with the
 difference spelled out.
 
+### Outgoing mail
+
+Processed invoices are sent **as** the delegated mailbox and **to** AP:
+
+| Setting | Default |
+| --- | --- |
+| `SEND_AS_ALIAS` | `logistics.invoices@lidl.us` |
+| `TARGET_EMAIL` | `invoice@lus.costs.invoice.schwarz` |
+
+The send-as address must be a **verified alias** on the account running the
+script (Gmail → Settings → Accounts → "Send mail as"). If it is not, Gmail
+ignores the `from` and sends as the account owner, so the alias is checked
+against `getAliases()` before every send and a mismatch is reported in the
+Configuration tab and the activity feed rather than quietly going out from the
+wrong address. **Send Test Email** proves the setup without waiting for a batch.
+
+A configuration that addressed invoices back to the account owner (or had no
+recipient at all) is corrected once, automatically, and the change is recorded
+in the feed.
+
+### The merged PDF
+
+The email carries **one** document: the coded summary page followed by the
+original invoice, named `Coded_<invoice>.pdf`. If the merge fails the code
+sheet and the original are sent as two attachments instead, with the reason in
+the feed — better than sending half the paperwork.
+
+The separate code-sheet/original pair is still written to the processed folder,
+because the scheduled carrier merge pairs them there by filename.
+
 ### Amounts
 
 The invoice total is chosen by scoring every money-shaped number on the page
@@ -94,12 +125,24 @@ against the label in front of it — `Amount Due` and `Total Due` outrank a bare
 as weights, quantities, reference numbers or payment terms are rejected outright.
 Credits (`(500.00)`, `500.00-`, `500.00 CR`) come through negative, and amounts
 agreeing across several labels, or reconciling against the line items, raise
-confidence. Anything that lands below `high` confidence is queued for review
-rather than logged; set `HOLD_LOW_CONFIDENCE_AMOUNTS` to `false` in `code.js` to
-log every amount as read instead.
+confidence. Anything that lands below `high` confidence is flagged (see below)
+rather than held back.
 
 Amounts are written to the log sheet as **numbers**, not text, so `SUM` and
 pivot tables over the Amount column work.
+
+### What actually gets held back
+
+Only two things stop an invoice reaching the ledger:
+
+- **The carrier is not on the confirmed list** — it would be filed in the wrong place.
+- **No RDC could be determined** — AP can correct a number, but they cannot guess
+  which RDC a load belonged to.
+
+A shaky *amount* does **not** hold the invoice. It goes out with the coding and
+is flagged instead: `[CHECK AMOUNT]` in the subject, a red banner on the code
+sheet naming the figure and the label it came from, and a note in the body. Set
+`HOLD_LOW_CONFIDENCE_AMOUNTS` to `true` in `code.js` to hold on the amount too.
 
 ## Email filters
 

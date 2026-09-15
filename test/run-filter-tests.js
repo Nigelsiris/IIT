@@ -383,8 +383,25 @@ group('gmail ingestion wiring', () => {
   S.LockService = { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) };
   S.DriveApp = { getFolderById: () => ({ getName: () => 'Processed', createFile: () => ({}) }) };
   S.Drive = { Files: { create: () => ({ id: 'temp-doc-id' }) } };
-  S.DocumentApp = { openById: () => ({ getBody: () => ({ getText: () => 'Invoice # INV6744248\nAmount Due $2,700.00' }) }) };
-  S.MailApp = { sendEmail() {} };
+  // Needs a routing keyword, or the coding is unresolved and the invoice is
+  // held for review rather than processed.
+  S.DocumentApp = {
+    openById: () => ({
+      getBody: () => ({
+        getText: () => [
+          'Arrive Logistics',
+          'Invoice # INV6744248',
+          'Destination Address',
+          'Lidl Distribution Center',
+          'Perryville, Maryland 21903',
+          'Amount Due $2,700.00'
+        ].join('\n')
+      })
+    })
+  };
+  S.Session = { getEffectiveUser: () => ({ getEmail: () => 'owner@lidl.us' }), getScriptTimeZone: () => 'UTC' };
+  S.ScriptApp = { getOAuthToken: () => 'token' };
+  S.UrlFetchApp = { fetch: () => ({ getResponseCode: () => 500, getBlob: () => null }) };
 
   const appendedRows = [];
   const sheet = {
@@ -396,10 +413,14 @@ group('gmail ingestion wiring', () => {
   S.SpreadsheetApp = { openById: () => ({ getSheetByName: () => sheet, insertSheet: () => sheet }) };
 
   let searched = null;
+  const sentMail = [];
   S.GmailApp = {
     search: query => { searched = query; return [{ getMessages: () => [inbound, outbound] }]; },
-    getUserLabels: () => []
+    getUserLabels: () => [],
+    getAliases: () => [],
+    sendEmail: (to, subject, body, options) => sentMail.push({ to, subject, body, options })
   };
+  S.clearSendAsAliasCache();
 
   // Filters are cached per execution; this test swapped the property store.
   S.clearEmailFiltersCache();
@@ -456,7 +477,12 @@ group('run budget', () => {
     }),
     getFileById: () => ({ getName: () => 'doc.pdf', getMimeType: () => 'application/pdf', getBlob: () => S.Utilities.newBlob('x', 'application/pdf', 'doc.pdf'), setTrashed() {} })
   };
-  S.GmailApp = { search: () => [{ getMessages: () => many }], getUserLabels: () => [] };
+  S.GmailApp = {
+    search: () => [{ getMessages: () => many }],
+    getUserLabels: () => [],
+    getAliases: () => [],
+    sendEmail() {}
+  };
 
   S.clearEmailFiltersCache();
   const summary = S.processIncomingPDFs();

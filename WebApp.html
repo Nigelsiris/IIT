@@ -1568,7 +1568,23 @@
                 <div class="form-group">
                   <label class="form-label">Target Email</label>
                   <input id="cfgTargetEmail" type="email" class="form-input" />
-                  <div class="form-hint">Processed invoices are emailed here</div>
+                  <div class="form-hint">Processed invoices are emailed here (AP)</div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Send As (delegated mailbox)</label>
+                  <input id="cfgSendAsAlias" type="email" class="form-input" placeholder="logistics.invoices@lidl.us" />
+                  <div class="form-hint">
+                    Must be a verified alias on this account &mdash; Gmail &rarr; Settings &rarr; Accounts &rarr;
+                    &ldquo;Send mail as&rdquo;. Leave blank to send as the account owner.
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Sender Display Name</label>
+                  <input id="cfgSendAsName" type="text" class="form-input" placeholder="Inbound Invoicing" />
+                </div>
+                <div class="form-group">
+                  <div id="mailStatus"></div>
+                  <button class="btn btn-secondary btn-sm" style="margin-top:8px;" onclick="sendTestEmail()">Send Test Email</button>
                 </div>
                 <div class="form-group">
                   <label class="form-label">Sheet ID</label>
@@ -1626,7 +1642,8 @@
       activeReviewId: null,
       activeReview: null,
       filters: null,
-      labelsLoaded: false
+      labelsLoaded: false,
+      mailStatus: null
     };
 
     let pollTimer = null;
@@ -1679,6 +1696,7 @@
           state.feed = data.feed || [];
           state.reviewQueue = data.reviewQueue || [];
           state.filters = (data.emailFilters && data.emailFilters.filters) || state.filters;
+          state.mailStatus = data.mailStatus || state.mailStatus;
           renderAll();
           showToast('Data refreshed', 'success', 2000);
         })
@@ -1717,6 +1735,9 @@
       setValue('cfgCarrierTypeFixes', state.config.carrierTypeFixes);
       setValue('cfgConfirmedCarriers', state.config.confirmedCarriers || '');
       setValue('cfgTargetEmail', state.config.targetEmail);
+      setValue('cfgSendAsAlias', state.config.sendAsAlias || '');
+      setValue('cfgSendAsName', state.config.sendAsName || '');
+      renderMailStatus();
       setValue('cfgSheetId', state.config.sheetId);
       setValue('cfgSheetName', state.config.sheetName);
       setValue('cfgInterval', state.config.runIntervalMinutes);
@@ -2077,6 +2098,8 @@
         carrierTypeFixes: getValue('cfgCarrierTypeFixes'),
           confirmedCarriers: getValue('cfgConfirmedCarriers'),
         targetEmail: getValue('cfgTargetEmail'),
+        sendAsAlias: getValue('cfgSendAsAlias'),
+        sendAsName: getValue('cfgSendAsName'),
         sheetId: getValue('cfgSheetId'),
         sheetName: getValue('cfgSheetName'),
         runIntervalMinutes: getValue('cfgInterval')
@@ -2242,6 +2265,56 @@
     }
 
     /* ─── UTILITIES ─── */
+    /* ─── MAIL STATUS ─── */
+    function renderMailStatus() {
+      var root = document.getElementById('mailStatus');
+      if (!root) return;
+      var status = state.mailStatus;
+      if (!status || !status.ok) {
+        root.innerHTML = '';
+        return;
+      }
+
+      var rows = [];
+      rows.push('<div><strong>Sending as:</strong> ' + escapeHtml(status.effectiveSender || '(unknown)') + '</div>');
+      rows.push('<div><strong>Sending to:</strong> ' + escapeHtml(status.targetEmail || '(not set)') + '</div>');
+
+      var cls = 'badge-success';
+      var note = 'Mail settings look right.';
+
+      if (status.sendingToSelf) {
+        cls = 'badge-error';
+        note = 'Invoices are addressed back to this account. Set Target Email to the AP address.';
+      } else if (status.requestedAlias && !status.aliasUsable) {
+        cls = 'badge-warning';
+        note = status.reason || ('"' + status.requestedAlias + '" is not usable as a send-as alias yet.');
+      } else if (!status.requestedAlias) {
+        cls = 'badge-warning';
+        note = 'No delegated mailbox set, so mail goes out as the account owner.';
+      }
+
+      root.innerHTML =
+        '<div style="font-size:12px;line-height:1.7;color:var(--text-secondary);">' + rows.join('') + '</div>' +
+        '<div style="margin-top:6px;"><span class="badge ' + cls + '">' + escapeHtml(note) + '</span></div>' +
+        (status.availableAliases && status.availableAliases.length
+          ? '<div class="form-hint" style="margin-top:6px;">Verified aliases: ' +
+              escapeHtml(status.availableAliases.join(', ')) + '</div>'
+          : '');
+    }
+
+    function sendTestEmail() {
+      showToast('Sending test email…', 'info', 2000);
+      google.script.run
+        .withSuccessHandler(function(result) {
+          if (!result.ok) { showToast(result.error || 'Test failed.', 'error'); return; }
+          state.mailStatus = result.status || state.mailStatus;
+          renderMailStatus();
+          showToast(result.message, 'success', 6000);
+        })
+        .withFailureHandler(function(err) { showToast(err.message || String(err), 'error'); })
+        .webSendTestEmail();
+    }
+
     /* ═══════════════════════════════════════════════════════
        EMAIL FILTERS
        ═══════════════════════════════════════════════════════ */

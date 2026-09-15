@@ -12,7 +12,9 @@ const PROPERTY_KEYS = {
   PROCESSING_FEED: 'PROCESSING_FEED',
   MERGE_WATCH_STATE: 'MERGE_WATCH_STATE',
   CONFIRMED_CARRIERS: 'CONFIRMED_CARRIERS',
-  EMAIL_FILTERS: 'EMAIL_FILTERS'
+  EMAIL_FILTERS: 'EMAIL_FILTERS',
+  SEND_AS_ALIAS: 'SEND_AS_ALIAS',
+  SEND_AS_NAME: 'SEND_AS_NAME'
 };
 
 const REVIEW_PREFIX = 'REVIEW_';
@@ -38,7 +40,11 @@ const DEFAULTS = {
   SOURCE_FOLDERS: DEFAULT_FOLDER_IDS.SOURCE_FOLDER_ID,
   PROCESSED_FOLDER_ID: DEFAULT_FOLDER_IDS.PROCESSED_FOLDER_ID,
   CARRIER_TYPE_FIXES: '',
-  TARGET_EMAIL: '',
+  // Processed invoices go to AP, sent as the delegated mailbox — not as
+  // whoever owns the script.
+  TARGET_EMAIL: 'invoice@lus.costs.invoice.schwarz',
+  SEND_AS_ALIAS: 'logistics.invoices@lidl.us',
+  SEND_AS_NAME: 'Inbound Invoicing',
   SHEET_ID: '',
   SHEET_NAME: 'Invoice Logger',
   RUN_INTERVAL_MINUTES: '15'
@@ -62,9 +68,13 @@ const FEED_LIMIT = 200;
 const MAX_INVOICES_PER_RUN = 20;
 const MAX_BATCH_RUN_MS = 5 * 60 * 1000;
 const MISSING_VALUE_LABEL = 'See Below';
-// Invoices whose total could not be tied to an explicit label are queued for a
-// human instead of being logged. Set to false to log every amount as-is.
-const HOLD_LOW_CONFIDENCE_AMOUNTS = true;
+// An invoice is held only when its CODING could not be resolved — that is the
+// part a person has to fix. A shaky amount is sent through with the coding and
+// flagged loudly instead, because AP can correct a number but cannot guess an
+// RDC. Set to true to go back to holding on a low-confidence amount as well.
+const HOLD_LOW_CONFIDENCE_AMOUNTS = false;
+// The placeholder determineCoding() emits when no RDC keyword matched.
+const UNRESOLVED_RDC_CODE = 'RDC-UNKNOWN';
 const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const GOOGLE_SHEETS_MIME_TYPE = 'application/vnd.google-apps.spreadsheet';
 
@@ -117,6 +127,8 @@ const LOG_HEADERS = [
 
 let invoiceSheetCache = null;
 let emailFiltersCache = null;
+let sendAsAliasCache = null;
+const MAIL_CONFIG_REPAIR_FLAG = 'MAIL_CONFIG_REPAIRED_AT';
 
 function onOpen() {
   try {
@@ -163,7 +175,9 @@ function getUiConfig() {
     processedFolderId: properties.getProperty(PROPERTY_KEYS.PROCESSED_FOLDER_ID) || DEFAULTS.PROCESSED_FOLDER_ID,
     carrierTypeFixes: properties.getProperty(PROPERTY_KEYS.CARRIER_TYPE_FIXES) || DEFAULTS.CARRIER_TYPE_FIXES,
     confirmedCarriers: properties.getProperty(PROPERTY_KEYS.CONFIRMED_CARRIERS) || '',
-    targetEmail: properties.getProperty(PROPERTY_KEYS.TARGET_EMAIL) || '',
+    targetEmail: properties.getProperty(PROPERTY_KEYS.TARGET_EMAIL) || DEFAULTS.TARGET_EMAIL,
+    sendAsAlias: properties.getProperty(PROPERTY_KEYS.SEND_AS_ALIAS) || DEFAULTS.SEND_AS_ALIAS,
+    sendAsName: properties.getProperty(PROPERTY_KEYS.SEND_AS_NAME) || DEFAULTS.SEND_AS_NAME,
     sheetId: properties.getProperty(PROPERTY_KEYS.SHEET_ID) || '',
     sheetName: properties.getProperty(PROPERTY_KEYS.SHEET_NAME) || DEFAULTS.SHEET_NAME,
     runIntervalMinutes: properties.getProperty(PROPERTY_KEYS.RUN_INTERVAL_MINUTES) || DEFAULTS.RUN_INTERVAL_MINUTES,
@@ -178,7 +192,10 @@ function saveUiConfig(payload) {
   properties.setProperty(PROPERTY_KEYS.PROCESSED_FOLDER_ID, (payload.processedFolderId || DEFAULTS.PROCESSED_FOLDER_ID).trim());
   properties.setProperty(PROPERTY_KEYS.CARRIER_TYPE_FIXES, (payload.carrierTypeFixes || DEFAULTS.CARRIER_TYPE_FIXES).trim());
   properties.setProperty(PROPERTY_KEYS.CONFIRMED_CARRIERS, (payload.confirmedCarriers || '').trim());
-  properties.setProperty(PROPERTY_KEYS.TARGET_EMAIL, (payload.targetEmail || '').trim());
+  properties.setProperty(PROPERTY_KEYS.TARGET_EMAIL, (payload.targetEmail || DEFAULTS.TARGET_EMAIL).trim());
+  properties.setProperty(PROPERTY_KEYS.SEND_AS_ALIAS, (payload.sendAsAlias || '').trim());
+  properties.setProperty(PROPERTY_KEYS.SEND_AS_NAME, (payload.sendAsName || DEFAULTS.SEND_AS_NAME).trim());
+  clearSendAsAliasCache();
   properties.setProperty(PROPERTY_KEYS.SHEET_ID, (payload.sheetId || '').trim());
   properties.setProperty(PROPERTY_KEYS.SHEET_NAME, (payload.sheetName || DEFAULTS.SHEET_NAME).trim());
   properties.setProperty(PROPERTY_KEYS.RUN_INTERVAL_MINUTES, runIntervalMinutes);
@@ -230,6 +247,7 @@ function uiCleanupProcessedState() {
 }
 
 function getWebAppBootstrapData() {
+  ensureMailConfiguration();
   return {
     config: getUiConfig(),
     mappings: getExtractionMappings(),
@@ -237,7 +255,8 @@ function getWebAppBootstrapData() {
     lastRun: getLastRunSummary(),
     feed: getProcessingFeed(120),
     reviewQueue: getAllReviewItems(),
-    emailFilters: webGetEmailFilters()
+    emailFilters: webGetEmailFilters(),
+    mailStatus: webGetMailStatus()
   };
 }
 
@@ -590,11 +609,15 @@ function webApproveReview(reviewId, editedData) {
       ? buildOutputBlobs(carrierType, item.fileName, generatedCodedPdfBlob, pdfBlob, mergePairId)
       : buildOutputBlobs(carrierType, item.fileName, generatedCodedPdfBlob, null, mergePairId);
 
-    MailApp.sendEmail({
-      to: config.TARGET_EMAIL,
-      subject: 'Processed Invoice: ' + item.fileName,
-      body: 'Attached are two files:\n1) Code sheet\n2) Original invoice\n\nExtracted PO: ' + invoiceData.po + '\nCoding Applied: ' + appliedCoding,
-      attachments: outputBlobs
+    const emailPackage = buildInvoiceEmailAttachments(
+      invoiceData, appliedCoding, generatedCodedPdfBlob, pdfBlob, item.fileName, outputBlobs
+    );
+
+    sendInvoiceEmail(config, {
+      fileName: item.fileName,
+      subject: buildInvoiceEmailSubject(item.fileName, invoiceData),
+      body: buildInvoiceEmailBody(invoiceData, appliedCoding, emailPackage),
+      attachments: emailPackage.attachments
     });
 
     const processedFolder = DriveApp.getFolderById(config.PROCESSED_FOLDER_ID);
@@ -905,6 +928,7 @@ function runUiAction(action) {
 }
 
 function runAllProcessing() {
+  ensureMailConfiguration();
   appendProcessingFeed('info', 'Starting runAllProcessing.', {});
   const driveSummary = processDriveFolders();
   const gmailSummary = ENABLE_GMAIL_INGESTION ? processIncomingPDFs() : { disabled: true, reason: 'Gmail ingestion disabled (folder-only mode).' };
@@ -1106,6 +1130,7 @@ function expandArchivesInSourceFolders(config) {
 function processDriveFolders() {
   const config = getConfig();
   assertRequiredConfig(config, ['SOURCE_FOLDERS', 'PROCESSED_FOLDER_ID', 'SHEET_ID', 'TARGET_EMAIL']);
+  ensureMailConfiguration();
   appendProcessingFeed('info', 'Drive processing started.', { sourceFolders: config.SOURCE_FOLDERS });
   const archiveExpansion = expandArchivesInSourceFolders(config);
   const startedAt = Date.now();
@@ -1262,7 +1287,10 @@ function processDriveFileCore(file, sourceLabel, processedFolder, carrierFolderC
     return;
   }
 
-  const result = processInvoiceFile(file.getBlob(), file.getName(), sourceLabel, processingKey, config, file.getMimeType(), { sendEmail: false });
+  const result = processInvoiceFile(file.getBlob(), file.getName(), sourceLabel, processingKey, config, file.getMimeType(), {
+    sendEmail: false,
+    fileId: file.getId()
+  });
 
   if (result.ok && result.status === 'processed') {
     summary.processed += 1;
@@ -2810,13 +2838,15 @@ function processInvoiceFile(fileBlob, fileName, source, processingKey, config, m
     // is worse — it reconciles to the wrong number and nobody notices.
     const holdReason = !isCarrierConfirmed(carrierType, runtimeConfig)
       ? 'unconfirmed_carrier'
-      : (shouldHoldForAmountReview(invoiceData) ? 'low_confidence_amount' : null);
+      : (shouldHoldForAmountReview(invoiceData, appliedCoding)
+        ? (isCodingResolved(appliedCoding) ? 'low_confidence_amount' : 'unresolved_coding')
+        : null);
 
     if (holdReason) {
       const reviewId = 'rv-' + Date.now() + '-' + (claim.stateKey || fileName).slice(0, 8);
       saveReviewItem({
         reviewId: reviewId,
-        fileId: (claim.details && claim.details.fileId) || null,
+        fileId: processingOptions.fileId || (claim.details && claim.details.fileId) || null,
         fileName: fileName,
         source: source,
         ocrText: extractedText.slice(0, 4000),
@@ -2830,7 +2860,9 @@ function processInvoiceFile(fileBlob, fileName, source, processingKey, config, m
       clearProcessingState(claim);
       const holdMessage = holdReason === 'unconfirmed_carrier'
         ? `Held for review — unconfirmed carrier: "${carrierType}" (${fileName})`
-        : `Held for review — amount needs checking (${invoiceData.amount}) (${fileName})`;
+        : (holdReason === 'unresolved_coding'
+          ? `Held for review — no RDC could be determined (${fileName})`
+          : `Held for review — amount needs checking (${invoiceData.amount}) (${fileName})`);
       appendProcessingFeed('warning', holdMessage, {
         reviewId,
         carrierType,
@@ -2862,13 +2894,16 @@ function processInvoiceFile(fileBlob, fileName, source, processingKey, config, m
     const generatedCodedPdfBlob = generateHtmlPdf(invoiceData, appliedCoding, fileName);
     const mergePairId = buildMergePairId(claim.stateKey || processingKey || fileName);
     const outputBlobs = buildOutputBlobs(carrierType, fileName, generatedCodedPdfBlob, fileBlob, mergePairId);
+    const emailPackage = buildInvoiceEmailAttachments(
+      invoiceData, appliedCoding, generatedCodedPdfBlob, fileBlob, fileName, outputBlobs
+    );
 
     if (processingOptions.sendEmail !== false) {
-      MailApp.sendEmail({
-        to: runtimeConfig.TARGET_EMAIL,
-        subject: `Processed Invoice: ${fileName}`,
-        body: `Attached are two files:\n1) Code sheet\n2) Original invoice\n\nExtracted PO: ${invoiceData.po}\nCoding Applied: ${appliedCoding}`,
-        attachments: outputBlobs
+      sendInvoiceEmail(runtimeConfig, {
+        fileName: fileName,
+        subject: buildInvoiceEmailSubject(fileName, invoiceData),
+        body: buildInvoiceEmailBody(invoiceData, appliedCoding, emailPackage),
+        attachments: emailPackage.attachments
       });
     }
 
@@ -2912,15 +2947,25 @@ function processSpreadsheetInvoiceFile(fileBlob, fileName, source, claim, runtim
 
     // Either the carrier is unknown, or the workbook does not add up. Both mean
     // a person should look before any of this reaches the ledger.
+    // Same rule as the PDF path: unresolved coding is the thing a person has to
+    // fix. If not one line could be routed to an RDC, hold the whole file.
+    const anyCodingResolved = invoices.some(function(invoice) {
+      return (invoice.groups || []).some(function(group) {
+        return isCodingResolved(group.coding);
+      });
+    });
+
     const holdReason = !isCarrierConfirmed(spreadsheetData.carrierType, runtimeConfig)
       ? 'unconfirmed_carrier'
-      : (reconciliation.needsReview ? 'total_mismatch' : null);
+      : (!anyCodingResolved
+        ? 'unresolved_coding'
+        : (reconciliation.needsReview ? 'total_mismatch' : null));
 
     if (holdReason) {
       const reviewId = 'rv-' + Date.now() + '-' + (claim.stateKey || fileName).slice(0, 8);
       saveReviewItem({
         reviewId: reviewId,
-        fileId: (claim.details && claim.details.fileId) || null,
+        fileId: (options && options.fileId) || (claim.details && claim.details.fileId) || null,
         fileName: fileName,
         source: source,
         ocrText: reconciliation.issues.join('\n'),
@@ -2936,7 +2981,9 @@ function processSpreadsheetInvoiceFile(fileBlob, fileName, source, claim, runtim
       clearProcessingState(claim);
       const holdMessage = holdReason === 'unconfirmed_carrier'
         ? `Held for review — unconfirmed carrier: "${spreadsheetData.carrierType}" (${fileName})`
-        : `Held for review — spreadsheet totals do not reconcile (${fileName}): ${reconciliation.issues.join('; ')}`;
+        : (holdReason === 'unresolved_coding'
+          ? `Held for review — no RDC could be determined for any line (${fileName})`
+          : `Held for review — spreadsheet totals do not reconcile (${fileName}): ${reconciliation.issues.join('; ')}`);
       appendProcessingFeed('warning', holdMessage, {
         reviewId,
         carrierType: spreadsheetData.carrierType,
@@ -2962,14 +3009,23 @@ function processSpreadsheetInvoiceFile(fileBlob, fileName, source, claim, runtim
       mergePairId
     );
 
+    const emailPackage = buildInvoiceEmailAttachments(
+      invoices.length === 1 ? invoices[0].invoiceData : null,
+      spreadsheetData.codingSummary,
+      spreadsheetData.codeSheetBlob,
+      spreadsheetData.originalPdfBlob,
+      fileName,
+      outputBlobs
+    );
+
     if (!options || options.sendEmail !== false) {
-      MailApp.sendEmail({
-        to: runtimeConfig.TARGET_EMAIL,
+      sendInvoiceEmail(runtimeConfig, {
+        fileName: fileName,
         subject: `Processed Invoice: ${fileName}`,
-        body: `Attached are two files:\n1) Code sheet\n2) Original invoice\n\n` +
+        body: `${emailPackage.merged ? 'Attached is the coded summary merged with the original invoice.' : 'Attached are the code sheet and the original invoice.'}\n\n` +
           `Invoices found in this file: ${invoices.length}\n` +
           `Split coding summary: ${spreadsheetData.codingSummary}`,
-        attachments: outputBlobs
+        attachments: emailPackage.attachments
       });
     }
 
@@ -4495,9 +4551,23 @@ function generateHtmlPdf(data, coding, originalName) {
   const amountNoDollar = (data.amount || '').replace(/\$/g, '').trim();
   const amountDisplay = amountNoDollar ? `$${escapeHtml(amountNoDollar)}` : MISSING_VALUE_LABEL;
 
+  // The coding is what AP cannot reconstruct, so it is always trustworthy here.
+  // An amount we could not tie to an explicit label still goes out, but it says
+  // so on the face of the sheet rather than looking like a confirmed figure.
+  const amountUncertain = isAmountUncertain(data);
+  const amountBanner = amountUncertain
+    ? `<div style="margin: 16px 0; padding: 12px 14px; border-left: 4px solid #d93025; background: #fce8e6; color: #7a1a12; font-size: 13px;">
+         <strong>Check the amount before posting.</strong>
+         The coding above is confirmed; the amount was read as <strong>${amountDisplay}</strong>${
+           data.amountLabel ? ` near &ldquo;${escapeHtml(String(data.amountLabel).trim())}&rdquo;` : ''
+         } and could not be tied to an explicit total on the invoice.
+       </div>`
+    : '';
+
   const htmlContent = `
     <div style="font-family: Arial, sans-serif; padding: 30px; color: #333;">
       <h1 style="border-bottom: 2px solid #4285F4; padding-bottom: 10px; color: #4285F4;">Invoice Processing Summary</h1>
+      ${amountBanner}
       <table style="width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px;">
         <tr>
           <td style="padding: 12px 8px; border-bottom: 1px solid #eee; width: 30%; background-color: #f8f9fa;"><strong>Coding Applied</strong></td>
@@ -5181,21 +5251,41 @@ function extractInvoiceData(text, fileName) {
 }
 
 /**
- * Should this invoice go to a human before its amount is trusted?
+ * Is the routing code on this invoice usable?
  *
- * Controlled by HOLD_LOW_CONFIDENCE_AMOUNTS. Only weak reads are held — a total
- * that carried an explicit "Amount Due"/"Total" label, or that reconciles
- * against the line items, goes straight through.
+ * determineCoding() falls back to RDC-UNKNOWN when nothing in the document
+ * matched a routing keyword. That is the one thing a person genuinely has to
+ * resolve — AP can correct an amount, but they cannot guess which RDC a load
+ * belonged to.
  */
-function shouldHoldForAmountReview(invoiceData) {
-  if (!HOLD_LOW_CONFIDENCE_AMOUNTS) return false;
-  if (!invoiceData) return false;
+function isCodingResolved(appliedCoding) {
+  const coding = String(appliedCoding || '').trim();
+  if (!coding) return false;
+  const rdc = extractRdcCodeFromCoding(coding);
+  return !!rdc && rdc !== UNRESOLVED_RDC_CODE;
+}
 
+/**
+ * Does the amount need flagging in the email and on the code sheet?
+ * Flagging is not holding — the invoice still goes out.
+ */
+function isAmountUncertain(invoiceData) {
+  if (!invoiceData) return true;
   const confidence = invoiceData.amountConfidence;
-  if (confidence === 'high' || confidence === 'confirmed') return false;
+  return confidence !== 'high' && confidence !== 'confirmed';
+}
 
-  // No amount at all, or an amount we could not justify from its label.
-  return true;
+/**
+ * Should this invoice be held back from the ledger entirely?
+ *
+ * Only when the coding is unresolved. A questionable amount rides along with
+ * a flag (see isAmountUncertain) unless HOLD_LOW_CONFIDENCE_AMOUNTS is on.
+ */
+function shouldHoldForAmountReview(invoiceData, appliedCoding) {
+  if (!isCodingResolved(appliedCoding)) {
+    return true;
+  }
+  return HOLD_LOW_CONFIDENCE_AMOUNTS && isAmountUncertain(invoiceData);
 }
 
 
@@ -5383,6 +5473,308 @@ function buildOutputFileNames(carrierType, originalName, mergePairId) {
     codeSheetName: `${safeCarrier} - ${pairSegment}Code Sheet - ${baseName}.pdf`
   };
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * OUTGOING MAIL
+ *
+ * Processed invoices have to leave as the delegated AP mailbox, not as whoever
+ * happens to own the script. MailApp cannot do that at all — it always sends
+ * as the effective user — so everything goes through GmailApp, which honours a
+ * verified "send mail as" alias.
+ *
+ * The alias has to be set up once in Gmail (Settings → Accounts → Send mail as)
+ * for the account running this script. If it is not there, Gmail silently
+ * ignores the `from` and sends as the owner, so the alias is checked against
+ * getAliases() first and a mismatch is reported loudly rather than quietly
+ * producing mail from the wrong address — which is exactly the symptom that
+ * started this.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * One-time correction for a mail configuration that sends invoices to the
+ * operator instead of to AP.
+ *
+ * Only two cases are touched, both of which are unambiguous misconfigurations
+ * rather than choices: TARGET_EMAIL unset, or TARGET_EMAIL equal to the address
+ * running the script. Anything else is left alone. Runs once, guarded by a
+ * flag, and says what it did in the activity feed.
+ */
+function ensureMailConfiguration() {
+  const properties = PropertiesService.getScriptProperties();
+  if (properties.getProperty(MAIL_CONFIG_REPAIR_FLAG)) {
+    return { repaired: false, reason: 'already_checked' };
+  }
+  properties.setProperty(MAIL_CONFIG_REPAIR_FLAG, new Date().toISOString());
+
+  let owner = '';
+  try {
+    owner = String(Session.getEffectiveUser().getEmail() || '').toLowerCase();
+  } catch (error) {
+    owner = '';
+  }
+
+  const current = String(properties.getProperty(PROPERTY_KEYS.TARGET_EMAIL) || '').trim();
+  const sendsToSelf = !!owner && current.toLowerCase() === owner;
+
+  if (current && !sendsToSelf) {
+    return { repaired: false, reason: 'looks_intentional', targetEmail: current };
+  }
+
+  properties.setProperty(PROPERTY_KEYS.TARGET_EMAIL, DEFAULTS.TARGET_EMAIL);
+  if (!properties.getProperty(PROPERTY_KEYS.SEND_AS_ALIAS)) {
+    properties.setProperty(PROPERTY_KEYS.SEND_AS_ALIAS, DEFAULTS.SEND_AS_ALIAS);
+  }
+
+  appendProcessingFeed('warning', `Processed invoices were addressed to ${current || '(nobody)'}; switched to ${DEFAULTS.TARGET_EMAIL}.`, {
+    from: current,
+    to: DEFAULTS.TARGET_EMAIL,
+    sendAsAlias: properties.getProperty(PROPERTY_KEYS.SEND_AS_ALIAS),
+    reason: sendsToSelf ? 'was addressed to the script owner' : 'was not set'
+  });
+
+  return { repaired: true, from: current, to: DEFAULTS.TARGET_EMAIL };
+}
+
+
+/**
+ * Aliases this account may legitimately send as, lowercased.
+ * Cached per execution: getAliases() is a network call and invoices go out in
+ * batches.
+ */
+function getAvailableSendAsAliases() {
+  if (sendAsAliasCache) {
+    return sendAsAliasCache;
+  }
+  try {
+    sendAsAliasCache = GmailApp.getAliases().map(function(alias) {
+      return String(alias || '').toLowerCase().trim();
+    }).filter(Boolean);
+  } catch (error) {
+    Logger.log('Could not read Gmail aliases: ' + error.message);
+    sendAsAliasCache = [];
+  }
+  return sendAsAliasCache;
+}
+
+function clearSendAsAliasCache() {
+  sendAsAliasCache = null;
+}
+
+/**
+ * Work out which address to send as.
+ * Returns { alias, usable, reason } — `alias` is '' when the message should go
+ * out as the account owner.
+ */
+function resolveSendAsAlias(config) {
+  const requested = String((config && config.SEND_AS_ALIAS) || '').toLowerCase().trim();
+  if (!requested) {
+    return { alias: '', usable: false, reason: 'No send-as alias configured.' };
+  }
+
+  const available = getAvailableSendAsAliases();
+  if (available.length === 0) {
+    return {
+      alias: '',
+      usable: false,
+      reason: `Gmail reported no send-as aliases for this account, so "${requested}" cannot be used.`
+    };
+  }
+  if (available.indexOf(requested) === -1) {
+    return {
+      alias: '',
+      usable: false,
+      reason: `"${requested}" is not a verified send-as alias on this account (available: ${available.join(', ')}).`
+    };
+  }
+
+  return { alias: requested, usable: true, reason: '' };
+}
+
+/**
+ * Send one processed-invoice email.
+ *
+ * Fails loudly on a misconfigured sender rather than sending as the wrong
+ * address: mail that appears to come from an individual instead of the AP
+ * mailbox gets rejected or misrouted downstream, and nobody notices for weeks.
+ */
+function sendInvoiceEmail(config, message) {
+  const runtimeConfig = config || getConfig();
+  const to = String(runtimeConfig.TARGET_EMAIL || '').trim();
+
+  if (!to) {
+    throw new Error('TARGET_EMAIL is not set — nowhere to send the processed invoice.');
+  }
+
+  const options = {
+    attachments: message.attachments || [],
+    name: runtimeConfig.SEND_AS_NAME || 'Inbound Invoicing'
+  };
+
+  const sender = resolveSendAsAlias(runtimeConfig);
+  if (sender.usable) {
+    options.from = sender.alias;
+  } else if (runtimeConfig.SEND_AS_ALIAS) {
+    // Configured but unusable — say so once per message so it shows up in the
+    // feed next to the invoice it affected.
+    appendProcessingFeed('warning', `Sending as the account owner instead of ${runtimeConfig.SEND_AS_ALIAS}: ${sender.reason}`, {
+      fileName: message.fileName || null,
+      requestedAlias: runtimeConfig.SEND_AS_ALIAS,
+      availableAliases: getAvailableSendAsAliases()
+    });
+  }
+
+  GmailApp.sendEmail(to, message.subject, message.body, options);
+
+  appendProcessingFeed('info', `Emailed ${message.fileName || 'invoice'} to ${to}`, {
+    to: to,
+    from: sender.usable ? sender.alias : '(account owner)',
+    attachments: (message.attachments || []).map(function(blob) { return blob.getName(); })
+  });
+}
+
+/**
+ * Subject line. An amount we could not tie to an explicit total is called out
+ * here so it is visible before the mail is even opened.
+ */
+function buildInvoiceEmailSubject(fileName, invoiceData) {
+  const flag = isAmountUncertain(invoiceData) ? '[CHECK AMOUNT] ' : '';
+  return `${flag}Processed Invoice: ${fileName}`;
+}
+
+function buildInvoiceEmailBody(invoiceData, appliedCoding, emailPackage) {
+  const data = invoiceData || {};
+  const lines = [];
+
+  lines.push(emailPackage && emailPackage.merged
+    ? 'Attached is the coded summary merged with the original invoice.'
+    : 'Attached are the code sheet and the original invoice.');
+  lines.push('');
+  lines.push(`Coding Applied: ${appliedCoding}`);
+  lines.push(`Invoice #: ${data.invoiceNumber || MISSING_VALUE_LABEL}`);
+  lines.push(`PO #: ${data.po || MISSING_VALUE_LABEL}`);
+  lines.push(`Amount: ${data.amount || MISSING_VALUE_LABEL}`);
+
+  if (isAmountUncertain(data)) {
+    lines.push('');
+    lines.push('NOTE: the coding above is confirmed, but the amount could not be tied to an');
+    lines.push('explicit total on the invoice. Please check it against the attached document');
+    lines.push('before posting.');
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Report the mail setup to the web app so a wrong sender is visible in the UI
+ * rather than only in delivered mail.
+ */
+function webGetMailStatus() {
+  try {
+    const config = getConfig();
+    const sender = resolveSendAsAlias(config);
+    let owner = '';
+    try {
+      owner = Session.getEffectiveUser().getEmail();
+    } catch (error) {
+      owner = '';
+    }
+
+    return {
+      ok: true,
+      targetEmail: config.TARGET_EMAIL || '',
+      requestedAlias: config.SEND_AS_ALIAS || '',
+      effectiveSender: sender.usable ? sender.alias : owner,
+      aliasUsable: sender.usable,
+      reason: sender.reason,
+      availableAliases: getAvailableSendAsAliases(),
+      owner: owner,
+      // The bug this was written for: invoices addressed back to the operator.
+      sendingToSelf: !!owner && owner.toLowerCase() === String(config.TARGET_EMAIL || '').toLowerCase()
+    };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+/**
+ * Send a test message with the current sender/recipient settings, so the setup
+ * can be proven before the next batch runs.
+ */
+function webSendTestEmail() {
+  try {
+    const config = getConfig();
+    sendInvoiceEmail(config, {
+      fileName: 'mail-settings-test',
+      subject: 'Inbound Invoicing — mail settings test',
+      body: [
+        'This is a test from the Inbound Invoicing Tool.',
+        '',
+        `Sent to: ${config.TARGET_EMAIL}`,
+        `Requested send-as alias: ${config.SEND_AS_ALIAS || '(none)'}`,
+        '',
+        'If the From: address on this message is not the alias above, the alias is not',
+        'verified on this account — add it in Gmail under Settings > Accounts >',
+        '"Send mail as", then run this test again.'
+      ].join('\n'),
+      attachments: []
+    });
+    return { ok: true, message: `Test email sent to ${config.TARGET_EMAIL}.`, status: webGetMailStatus() };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+/**
+ * The attachments that go on the outgoing email.
+ *
+ * AP wants ONE document: the coded summary page followed by the original
+ * invoice. mergePdfsBestEffort() builds exactly that (a master spreadsheet
+ * holding the summary plus the converted original, exported as a single PDF)
+ * and, unlike a pdf-lib merge, it is synchronous — which matters because this
+ * runs inside google.script.run handlers that cannot await.
+ *
+ * If the merge fails for any reason the pair is sent as two attachments rather
+ * than sending nothing, and the failure is recorded in the feed.
+ */
+function buildInvoiceEmailAttachments(invoiceData, appliedCoding, codeSheetBlob, originalPdfBlob, fileName, outputBlobs) {
+  if (!originalPdfBlob) {
+    appendProcessingFeed('warning', `No original document available to merge for ${fileName}; sending the code sheet alone.`, {
+      fileName: fileName
+    });
+    return { attachments: [codeSheetBlob], merged: false, reason: 'no_original' };
+  }
+
+  try {
+    const merged = mergePdfsBestEffort(invoiceData, appliedCoding, originalPdfBlob, fileName);
+    if (merged.ok && merged.blob) {
+      return {
+        attachments: [merged.blob.setName(buildMergedAttachmentName(fileName))],
+        merged: true,
+        method: merged.method
+      };
+    }
+    appendProcessingFeed('warning', `Could not merge the code sheet with ${fileName}; sending both files separately.`, {
+      fileName: fileName,
+      error: merged.error || 'unknown'
+    });
+  } catch (error) {
+    appendProcessingFeed('warning', `Merge threw for ${fileName}; sending both files separately.`, {
+      fileName: fileName,
+      error: error.message
+    });
+  }
+
+  return {
+    attachments: (outputBlobs && outputBlobs.length) ? outputBlobs : [codeSheetBlob, originalPdfBlob],
+    merged: false,
+    reason: 'merge_failed'
+  };
+}
+
+function buildMergedAttachmentName(fileName) {
+  return 'Coded_' + stripInvoiceExtension(fileName) + '.pdf';
+}
+
 
 function buildOutputBlobs(carrierType, originalName, codeSheetBlob, originalPdfBlob, mergePairId) {
   const names = buildOutputFileNames(carrierType, originalName, mergePairId);
@@ -5595,6 +5987,8 @@ function getConfig() {
     CARRIER_TYPE_FIX_MAP: parseAutoFixMappings(carrierTypeFixesRaw),
     CONFIRMED_CARRIERS: parseConfirmedCarriers(properties.getProperty(PROPERTY_KEYS.CONFIRMED_CARRIERS) || ''),
     TARGET_EMAIL: properties.getProperty(PROPERTY_KEYS.TARGET_EMAIL) || DEFAULTS.TARGET_EMAIL,
+    SEND_AS_ALIAS: properties.getProperty(PROPERTY_KEYS.SEND_AS_ALIAS) || DEFAULTS.SEND_AS_ALIAS,
+    SEND_AS_NAME: properties.getProperty(PROPERTY_KEYS.SEND_AS_NAME) || DEFAULTS.SEND_AS_NAME,
     SHEET_ID: properties.getProperty(PROPERTY_KEYS.SHEET_ID) || DEFAULTS.SHEET_ID,
     SHEET_NAME: properties.getProperty(PROPERTY_KEYS.SHEET_NAME) || DEFAULTS.SHEET_NAME,
     RUN_INTERVAL_MINUTES: properties.getProperty(PROPERTY_KEYS.RUN_INTERVAL_MINUTES) || DEFAULTS.RUN_INTERVAL_MINUTES,
