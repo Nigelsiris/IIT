@@ -4,6 +4,6 @@
   "description": "Inbound Invoicing Tool - Google Apps Script automation for inbound freight invoices",
   "private": true,
   "scripts": {
-    "test": "node test/run-tests.js && node test/run-sheet-tests.js && node test/run-pipeline-tests.js"
+    "test": "node test/run-tests.js && node test/run-sheet-tests.js && node test/run-pipeline-tests.js && node test/run-filter-tests.js"
   }
 }

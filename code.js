@@ -11,7 +11,8 @@ const PROPERTY_KEYS = {
   EXTRACTION_MAPPINGS: 'EXTRACTION_MAPPINGS',
   PROCESSING_FEED: 'PROCESSING_FEED',
   MERGE_WATCH_STATE: 'MERGE_WATCH_STATE',
-  CONFIRMED_CARRIERS: 'CONFIRMED_CARRIERS'
+  CONFIRMED_CARRIERS: 'CONFIRMED_CARRIERS',
+  EMAIL_FILTERS: 'EMAIL_FILTERS'
 };
 
 const REVIEW_PREFIX = 'REVIEW_';
@@ -115,6 +116,7 @@ const LOG_HEADERS = [
 ];
 
 let invoiceSheetCache = null;
+let emailFiltersCache = null;
 
 function onOpen() {
   try {
@@ -155,7 +157,8 @@ function doGet() {
 function getUiConfig() {
   const properties = PropertiesService.getScriptProperties();
   return {
-    searchQuery: properties.getProperty(PROPERTY_KEYS.SEARCH_QUERY) || DEFAULTS.SEARCH_QUERY,
+    // Read-only here: the Email Filters tab owns this now.
+    searchQuery: buildGmailSearchQuery(getEmailFilters().fetch),
     sourceFolders: properties.getProperty(PROPERTY_KEYS.SOURCE_FOLDERS) || DEFAULTS.SOURCE_FOLDERS,
     processedFolderId: properties.getProperty(PROPERTY_KEYS.PROCESSED_FOLDER_ID) || DEFAULTS.PROCESSED_FOLDER_ID,
     carrierTypeFixes: properties.getProperty(PROPERTY_KEYS.CARRIER_TYPE_FIXES) || DEFAULTS.CARRIER_TYPE_FIXES,
@@ -171,7 +174,6 @@ function getUiConfig() {
 function saveUiConfig(payload) {
   const properties = PropertiesService.getScriptProperties();
   const runIntervalMinutes = String(Number(payload.runIntervalMinutes) || Number(DEFAULTS.RUN_INTERVAL_MINUTES));
-  properties.setProperty(PROPERTY_KEYS.SEARCH_QUERY, (payload.searchQuery || DEFAULTS.SEARCH_QUERY).trim());
   properties.setProperty(PROPERTY_KEYS.SOURCE_FOLDERS, (payload.sourceFolders || DEFAULTS.SOURCE_FOLDERS).trim());
   properties.setProperty(PROPERTY_KEYS.PROCESSED_FOLDER_ID, (payload.processedFolderId || DEFAULTS.PROCESSED_FOLDER_ID).trim());
   properties.setProperty(PROPERTY_KEYS.CARRIER_TYPE_FIXES, (payload.carrierTypeFixes || DEFAULTS.CARRIER_TYPE_FIXES).trim());
@@ -189,6 +191,7 @@ function saveUiConfig(payload) {
 }
 
 function initializeScriptProperties() {
+  clearEmailFiltersCache();
   const properties = PropertiesService.getScriptProperties();
   Object.keys(DEFAULTS).forEach(key => {
     const propertyKey = PROPERTY_KEYS[key];
@@ -233,7 +236,8 @@ function getWebAppBootstrapData() {
     sourceFiles: listSourcePdfFiles(100),
     lastRun: getLastRunSummary(),
     feed: getProcessingFeed(120),
-    reviewQueue: getAllReviewItems()
+    reviewQueue: getAllReviewItems(),
+    emailFilters: webGetEmailFilters()
   };
 }
 
@@ -1299,17 +1303,25 @@ function processDriveFileCore(file, sourceLabel, processedFolder, carrierFolderC
  * Logs all Gmail labels (to verify exact name/path) and tests several query variants.
  */
 /**
- * One-time fix: updates the saved Search Query Script Property to use the
- * correct nested label path. Run once from the Apps Script editor.
+ * One-time fix for the shorthand `label:ITBP`, which is not the label's real
+ * nested path. Goes through the saved filters — writing the raw property
+ * directly would just be overwritten the next time the filters are saved.
  */
 function fixGmailSearchQuery() {
-  const props = PropertiesService.getScriptProperties();
-  const current = props.getProperty(PROPERTY_KEYS.SEARCH_QUERY) || '';
-  const fixed = current.replace(/label:ITBP\b/g, 'label:Automation-Emails/ITBP');
-  props.setProperty(PROPERTY_KEYS.SEARCH_QUERY, fixed);
-  Logger.log('Search query updated: "' + current + '" → "' + fixed + '"');
-  appendProcessingFeed('info', 'Gmail search query fixed', { from: current, to: fixed });
-  return { ok: true, from: current, to: fixed };
+  const filters = getEmailFilters();
+  const before = buildGmailSearchQuery(filters.fetch);
+
+  filters.fetch.labels = filters.fetch.labels.map(function(label) {
+    return label === 'ITBP' ? 'Automation-Emails/ITBP' : label;
+  });
+  filters.fetch.rawQuery = String(filters.fetch.rawQuery || '')
+    .replace(/label:ITBP\b/g, 'label:Automation-Emails/ITBP');
+
+  const saved = saveEmailFilters(filters);
+  const after = buildGmailSearchQuery(saved.fetch);
+  Logger.log('Search query updated: "' + before + '" → "' + after + '"');
+  appendProcessingFeed('info', 'Gmail search query fixed', { from: before, to: after });
+  return { ok: true, from: before, to: after };
 }
 
 function debugGmailSearch() {
@@ -1346,6 +1358,966 @@ function debugGmailSearch() {
   return results;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * EMAIL FILTERING
+ *
+ * Gmail's own filters cannot tell these apart:
+ *
+ *   logistics.invoices@lidl.us  ──forwards──▶  you   (inbound carrier invoice)
+ *   logistics.invoices@lidl.us  ──forwards──▶  you   (outbound freight, ignore)
+ *
+ * Both arrive From: the delegated mailbox, so every native rule that keys on
+ * the sender matches both. The original sender, the original subject and the
+ * original recipient only exist inside the forwarded body.
+ *
+ * So this module does two things:
+ *
+ *   1. UNWRAPS the forward — parses the "---------- Forwarded message ---------"
+ *      / Outlook "From:/Sent:/To:/Subject:" envelope and the delegated-delivery
+ *      headers, exposing originalFrom / originalSubject / deliveredTo as
+ *      first-class fields.
+ *
+ *   2. Runs an ORDERED, UI-EDITABLE rule list over those fields. First rule
+ *      that matches wins and decides accept or reject; if nothing matches, the
+ *      configured default applies. First-match-wins is deliberate — it is the
+ *      only evaluation order a non-programmer can reliably predict, and the
+ *      filter tester can always name the single rule responsible.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+const EMAIL_FILTER_FIELDS = [
+  'effectiveFrom',
+  'originalFrom',
+  'from',
+  'to',
+  'cc',
+  'deliveredTo',
+  'replyTo',
+  'forwardedFrom',
+  'effectiveSubject',
+  'originalSubject',
+  'subject',
+  'body',
+  'attachmentName',
+  'any'
+];
+
+const EMAIL_FILTER_OPERATORS = [
+  'contains',
+  'notContains',
+  'equals',
+  'startsWith',
+  'endsWith',
+  'regex',
+  'domainIs',
+  'isEmpty',
+  'isNotEmpty'
+];
+
+const EMAIL_FILTER_ACTIONS = ['accept', 'reject'];
+const EMAIL_FILTER_DEFAULT_ACTIONS = ['accept', 'skip', 'review'];
+const EMAIL_FILTER_MAX_RULES = 100;
+const EMAIL_FILTER_BODY_LIMIT = 20000;
+
+/**
+ * Shipped defaults. The rules are deliberately concrete rather than clever:
+ * they encode the inbound/outbound split this tool was built for, and they are
+ * meant to be edited in the Email Filters tab, not treated as fixed.
+ */
+const DEFAULT_EMAIL_FILTERS = {
+  enabled: true,
+  fetch: {
+    mode: 'builder',
+    rawQuery: '',
+    unreadOnly: true,
+    hasAttachment: true,
+    newerThanDays: 30,
+    labels: [],
+    fromAnyOf: [],
+    deliveredToAnyOf: [],
+    subjectAnyOf: [],
+    extraTerms: ''
+  },
+  // Mailboxes that forward mail to you. Used to recognise a delegated forward
+  // and to look through it at the original sender.
+  delegatedMailboxes: [],
+  defaultAction: 'review',
+  markRejectedRead: false,
+  rules: [
+    {
+      id: 'rule-outbound-subject',
+      name: 'Skip outbound freight',
+      enabled: true,
+      action: 'reject',
+      field: 'effectiveSubject',
+      operator: 'regex',
+      value: '\\b(out\\s*bound|outbound|ob)\\b',
+      caseSensitive: false
+    },
+    {
+      id: 'rule-outbound-body',
+      name: 'Skip anything the body calls outbound',
+      enabled: true,
+      action: 'reject',
+      field: 'body',
+      operator: 'regex',
+      value: '\\boutbound\\s+(?:freight|shipment|load|delivery)\\b',
+      caseSensitive: false
+    },
+    {
+      id: 'rule-noise',
+      name: 'Skip auto-replies and bounces',
+      enabled: true,
+      action: 'reject',
+      field: 'subject',
+      operator: 'regex',
+      value: '(out of office|automatic reply|undeliverable|delivery status notification|read receipt)',
+      caseSensitive: false
+    },
+    {
+      id: 'rule-inbound-subject',
+      name: 'Process inbound invoices',
+      enabled: true,
+      action: 'accept',
+      field: 'effectiveSubject',
+      operator: 'regex',
+      value: '\\b(inbound|in\\s*bound|invoice|inv\\b|billing|freight bill)\\b',
+      caseSensitive: false
+    }
+  ]
+};
+
+/* ─── storage ─────────────────────────────────────────────────────────────── */
+
+/**
+ * Read the saved filters, migrating from the legacy raw SEARCH_QUERY the first
+ * time so an upgrade does not silently widen what gets processed.
+ */
+function getEmailFilters() {
+  // getConfig() derives SEARCH_QUERY from these, and getConfig() is called all
+  // over the place — including once per carrier auto-fix — so parse them once
+  // per execution rather than on every read.
+  if (emailFiltersCache) {
+    return emailFiltersCache;
+  }
+
+  const properties = PropertiesService.getScriptProperties();
+  const raw = properties.getProperty(PROPERTY_KEYS.EMAIL_FILTERS);
+
+  if (!raw) {
+    const migrated = migrateEmailFiltersFromSearchQuery(
+      properties.getProperty(PROPERTY_KEYS.SEARCH_QUERY) || DEFAULTS.SEARCH_QUERY
+    );
+    emailFiltersCache = normalizeEmailFilters(migrated);
+    return emailFiltersCache;
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    Logger.log('Email filters were unreadable, falling back to defaults: ' + error.message);
+    parsed = null;
+  }
+  emailFiltersCache = normalizeEmailFilters(parsed);
+  return emailFiltersCache;
+}
+
+/**
+ * Drop the per-execution filter cache. Call after anything writes the filter
+ * property behind getEmailFilters()'s back.
+ */
+function clearEmailFiltersCache() {
+  emailFiltersCache = null;
+}
+
+function saveEmailFilters(payload) {
+  const normalized = normalizeEmailFilters(payload);
+  emailFiltersCache = normalized;
+  PropertiesService.getScriptProperties()
+    .setProperty(PROPERTY_KEYS.EMAIL_FILTERS, JSON.stringify(normalized));
+  // Keep the legacy property in step so anything still reading it agrees.
+  PropertiesService.getScriptProperties()
+    .setProperty(PROPERTY_KEYS.SEARCH_QUERY, buildGmailSearchQuery(normalized.fetch));
+  return normalized;
+}
+
+/**
+ * Turn the legacy `has:attachment is:unread label:Automation-Emails/ITBP`
+ * string into builder settings, so the saved behaviour carries over and the
+ * label simply becomes one editable field among several.
+ */
+function migrateEmailFiltersFromSearchQuery(query) {
+  const migrated = JSON.parse(JSON.stringify(DEFAULT_EMAIL_FILTERS));
+  const parsedFetch = parseGmailQueryToFetchSettings(query);
+  migrated.fetch = parsedFetch;
+  // The legacy query was the only filter in place, so nothing was being
+  // rejected on content. Start permissive and let the rules be switched on
+  // deliberately rather than surprising anyone mid-week.
+  migrated.rules.forEach(function(rule) {
+    rule.enabled = rule.action === 'reject';
+  });
+  migrated.defaultAction = 'accept';
+  return migrated;
+}
+
+function normalizeEmailFilters(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const defaults = DEFAULT_EMAIL_FILTERS;
+  const fetchSource = source.fetch && typeof source.fetch === 'object' ? source.fetch : {};
+
+  const fetchSettings = {
+    mode: fetchSource.mode === 'raw' ? 'raw' : 'builder',
+    rawQuery: String(fetchSource.rawQuery || '').trim(),
+    unreadOnly: fetchSource.unreadOnly !== false,
+    hasAttachment: fetchSource.hasAttachment !== false,
+    newerThanDays: normalizeNewerThanDays(fetchSource.newerThanDays),
+    labels: normalizeStringList(fetchSource.labels),
+    fromAnyOf: normalizeStringList(fetchSource.fromAnyOf),
+    deliveredToAnyOf: normalizeStringList(fetchSource.deliveredToAnyOf),
+    subjectAnyOf: normalizeStringList(fetchSource.subjectAnyOf),
+    extraTerms: String(fetchSource.extraTerms || '').trim()
+  };
+
+  const rules = (Array.isArray(source.rules) ? source.rules : defaults.rules)
+    .slice(0, EMAIL_FILTER_MAX_RULES)
+    .map(normalizeEmailFilterRule)
+    .filter(Boolean);
+
+  return {
+    enabled: source.enabled !== false,
+    fetch: fetchSettings,
+    delegatedMailboxes: normalizeStringList(source.delegatedMailboxes).map(function(entry) {
+      return entry.toLowerCase();
+    }),
+    defaultAction: EMAIL_FILTER_DEFAULT_ACTIONS.indexOf(source.defaultAction) >= 0
+      ? source.defaultAction
+      : defaults.defaultAction,
+    markRejectedRead: source.markRejectedRead === true,
+    rules: rules
+  };
+}
+
+function normalizeEmailFilterRule(rule, index) {
+  if (!rule || typeof rule !== 'object') return null;
+
+  const field = EMAIL_FILTER_FIELDS.indexOf(rule.field) >= 0 ? rule.field : 'any';
+  const operator = EMAIL_FILTER_OPERATORS.indexOf(rule.operator) >= 0 ? rule.operator : 'contains';
+  const action = EMAIL_FILTER_ACTIONS.indexOf(rule.action) >= 0 ? rule.action : 'reject';
+  const value = String(rule.value === undefined || rule.value === null ? '' : rule.value).trim();
+
+  // Every operator except the emptiness checks needs something to match on.
+  if (!value && operator !== 'isEmpty' && operator !== 'isNotEmpty') {
+    return null;
+  }
+  if (operator === 'regex' && !isUsableRegexSource(value)) {
+    return null;
+  }
+
+  return {
+    id: String(rule.id || `rule-${Date.now()}-${index || 0}`),
+    name: String(rule.name || '').trim() || describeEmailFilterRule({ action, field, operator, value }),
+    enabled: rule.enabled !== false,
+    action: action,
+    field: field,
+    operator: operator,
+    value: value,
+    caseSensitive: rule.caseSensitive === true
+  };
+}
+
+function normalizeStringList(value) {
+  if (Array.isArray(value)) {
+    return value.map(function(item) { return String(item || '').trim(); }).filter(Boolean);
+  }
+  return String(value || '')
+    .split(/[\n,]/)
+    .map(function(item) { return item.trim(); })
+    .filter(Boolean);
+}
+
+function normalizeNewerThanDays(value) {
+  const days = Number(value);
+  if (!isFinite(days) || days <= 0) return 0;
+  return Math.min(Math.round(days), 3650);
+}
+
+function isUsableRegexSource(source) {
+  try {
+    new RegExp(source);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function describeEmailFilterRule(rule) {
+  const verb = rule.action === 'accept' ? 'Process' : 'Skip';
+  if (rule.operator === 'isEmpty') return `${verb} when ${rule.field} is empty`;
+  if (rule.operator === 'isNotEmpty') return `${verb} when ${rule.field} is set`;
+  return `${verb} when ${rule.field} ${rule.operator} "${rule.value}"`;
+}
+
+/* ─── fetch query ─────────────────────────────────────────────────────────── */
+
+/**
+ * Build the Gmail search string from the builder settings.
+ *
+ * This is only the coarse "what to pull out of the mailbox" pass — the rules
+ * below do the real work. Deliberately never returns an empty query, which
+ * would match the entire mailbox.
+ */
+function buildGmailSearchQuery(fetchSettings) {
+  const settings = (fetchSettings && typeof fetchSettings === 'object')
+    ? fetchSettings
+    : DEFAULT_EMAIL_FILTERS.fetch;
+
+  if (settings.mode === 'raw') {
+    return String(settings.rawQuery || '').trim() || DEFAULTS.SEARCH_QUERY;
+  }
+
+  const parts = [];
+  if (settings.hasAttachment !== false) parts.push('has:attachment');
+  if (settings.unreadOnly !== false) parts.push('is:unread');
+
+  const orGroup = function(prefix, values) {
+    const list = normalizeStringList(values);
+    if (list.length === 0) return;
+    const terms = list.map(function(value) { return prefix + ':' + quoteGmailTerm(value); });
+    parts.push(terms.length === 1 ? terms[0] : '(' + terms.join(' OR ') + ')');
+  };
+
+  orGroup('label', settings.labels);
+  orGroup('from', settings.fromAnyOf);
+  orGroup('deliveredto', settings.deliveredToAnyOf);
+  orGroup('subject', settings.subjectAnyOf);
+
+  const days = normalizeNewerThanDays(settings.newerThanDays);
+  if (days > 0) parts.push('newer_than:' + days + 'd');
+
+  const extra = String(settings.extraTerms || '').trim();
+  if (extra) parts.push(extra);
+
+  if (parts.length === 0) {
+    return 'has:attachment is:unread';
+  }
+  return parts.join(' ');
+}
+
+function quoteGmailTerm(value) {
+  const text = String(value || '').trim();
+  return /[\s()"]/.test(text) ? '"' + text.replace(/"/g, '') + '"' : text;
+}
+
+/**
+ * Best-effort reverse of buildGmailSearchQuery, used once to migrate whatever
+ * query was already configured into editable fields.
+ */
+function parseGmailQueryToFetchSettings(query) {
+  const settings = JSON.parse(JSON.stringify(DEFAULT_EMAIL_FILTERS.fetch));
+  let remaining = String(query || '').trim();
+
+  settings.labels = [];
+  settings.fromAnyOf = [];
+  settings.deliveredToAnyOf = [];
+  settings.subjectAnyOf = [];
+  settings.newerThanDays = 0;
+  settings.hasAttachment = false;
+  settings.unreadOnly = false;
+
+  const takeOperator = function(name, sink) {
+    const pattern = new RegExp(name + ':("[^"]*"|[^\\s()]+)', 'gi');
+    remaining = remaining.replace(pattern, function(match, captured) {
+      sink.push(String(captured).replace(/^"|"$/g, ''));
+      return ' ';
+    });
+  };
+
+  takeOperator('label', settings.labels);
+  takeOperator('from', settings.fromAnyOf);
+  takeOperator('deliveredto', settings.deliveredToAnyOf);
+  takeOperator('subject', settings.subjectAnyOf);
+
+  remaining = remaining.replace(/newer_than:(\d+)d/gi, function(match, days) {
+    settings.newerThanDays = normalizeNewerThanDays(days);
+    return ' ';
+  });
+  remaining = remaining.replace(/has:attachment/gi, function() {
+    settings.hasAttachment = true;
+    return ' ';
+  });
+  remaining = remaining.replace(/is:unread/gi, function() {
+    settings.unreadOnly = true;
+    return ' ';
+  });
+
+  // Whatever is left is either OR/parenthesis scaffolding from the groups we
+  // already consumed, or terms we do not model — keep the latter verbatim.
+  settings.extraTerms = remaining
+    .replace(/\bOR\b/gi, ' ')
+    .replace(/[()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return settings;
+}
+
+/* ─── forwarded-message unwrapping ────────────────────────────────────────── */
+
+const FORWARD_MARKER_PATTERN = /^\s*(?:-{2,}\s*(?:Forwarded message|Original Message)\s*-{2,}|Begin forwarded message:|_{10,})\s*$/i;
+const FORWARD_SUBJECT_PREFIX_PATTERN = /^\s*(?:(?:re|fw|fwd|tr|aw|wg|vs)\s*(?:\[\d+\])?\s*:\s*)+/i;
+
+/**
+ * Pull the address out of `Name <a@b.com>` / `<a@b.com>` / `a@b.com`.
+ */
+function extractEmailAddress(value) {
+  const text = String(value || '');
+  const angled = text.match(/<([^<>@\s]+@[^<>@\s]+)>/);
+  if (angled) return angled[1].toLowerCase();
+  const bare = text.match(/([^\s<>,;:"']+@[^\s<>,;:"']+\.[A-Za-z]{2,})/);
+  return bare ? bare[1].toLowerCase().replace(/[.,;:]+$/, '') : '';
+}
+
+function extractEmailDomain(value) {
+  const address = extractEmailAddress(value);
+  const at = address.lastIndexOf('@');
+  return at >= 0 ? address.slice(at + 1) : '';
+}
+
+/**
+ * "FW: Fwd: RE: Invoice 123" -> "Invoice 123"
+ */
+function stripForwardPrefixes(subject) {
+  let text = String(subject || '').trim();
+  let previous = null;
+  while (text !== previous) {
+    previous = text;
+    text = text.replace(FORWARD_SUBJECT_PREFIX_PATTERN, '').trim();
+  }
+  return text;
+}
+
+/**
+ * Read the forwarded envelope out of a message body.
+ *
+ * Handles the Gmail block ("---------- Forwarded message ---------" followed by
+ * From/Date/Subject/To) and the Outlook block (From/Sent/To/Subject with no
+ * marker at all). Returns the FIRST envelope found — for a delegated mailbox
+ * forwarding a carrier's mail, that is the carrier.
+ */
+function parseForwardedEnvelope(body) {
+  const lines = String(body || '').split('\n');
+  const limit = Math.min(lines.length, 400);
+
+  for (let i = 0; i < limit; i++) {
+    const isMarker = FORWARD_MARKER_PATTERN.test(lines[i]);
+    const startsHeaderBlock = /^\s*From:\s*\S/i.test(lines[i]);
+    if (!isMarker && !startsHeaderBlock) continue;
+
+    const envelope = readEnvelopeHeaders(lines, isMarker ? i + 1 : i, limit);
+    if (envelope) {
+      return envelope;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Read From/To/Cc/Subject/Date out of a contiguous header block.
+ * Requires at least a From and one of Subject/To so a stray "From:" in prose
+ * does not register as a forward.
+ */
+function readEnvelopeHeaders(lines, startIndex, limit) {
+  const envelope = { from: '', to: '', cc: '', subject: '', date: '' };
+  let seen = 0;
+  let blankRun = 0;
+
+  for (let i = startIndex; i < Math.min(limit, startIndex + 16); i++) {
+    const line = String(lines[i] || '');
+    if (!line.trim()) {
+      blankRun += 1;
+      // A single blank line inside the block is tolerated (Outlook inserts one);
+      // two means the block is over.
+      if (blankRun >= 2 && seen > 0) break;
+      continue;
+    }
+    blankRun = 0;
+
+    const match = line.match(/^\s*(From|To|Cc|Subject|Date|Sent|Reply-To)\s*:\s*(.*)$/i);
+    if (!match) {
+      if (seen > 0) break;
+      continue;
+    }
+
+    const key = match[1].toLowerCase();
+    const value = match[2].trim();
+    if (key === 'from' && !envelope.from) { envelope.from = value; seen += 1; }
+    else if (key === 'to' && !envelope.to) { envelope.to = value; seen += 1; }
+    else if (key === 'cc' && !envelope.cc) { envelope.cc = value; seen += 1; }
+    else if (key === 'subject' && !envelope.subject) { envelope.subject = value; seen += 1; }
+    else if ((key === 'date' || key === 'sent') && !envelope.date) { envelope.date = value; seen += 1; }
+  }
+
+  if (!envelope.from) return null;
+  if (!envelope.subject && !envelope.to) return null;
+  if (!extractEmailAddress(envelope.from) && !/\S/.test(envelope.from)) return null;
+  return envelope;
+}
+
+/**
+ * Read a header without assuming getHeader() exists on this runtime.
+ */
+function getMessageHeaderSafe(message, name) {
+  try {
+    if (message && typeof message.getHeader === 'function') {
+      return String(message.getHeader(name) || '');
+    }
+  } catch (error) {
+    // Header not present, or not exposed — treated the same as absent.
+  }
+  return '';
+}
+
+/**
+ * Everything the rules can match against, with the forward already unwrapped.
+ *
+ * `effectiveFrom` / `effectiveSubject` are the ones to reach for: on a normal
+ * message they are the message's own sender and subject, and on a forward from
+ * a delegated mailbox they are the ORIGINAL sender and subject — which is the
+ * whole point.
+ */
+function buildMessageFilterContext(message, attachments, filters) {
+  const delegated = (filters && filters.delegatedMailboxes) || [];
+  const from = String(message.getFrom ? message.getFrom() : '');
+  const to = String(message.getTo ? message.getTo() : '');
+  const cc = (function() {
+    try { return String(message.getCc ? message.getCc() : ''); } catch (error) { return ''; }
+  })();
+  const replyTo = (function() {
+    try { return String(message.getReplyTo ? message.getReplyTo() : ''); } catch (error) { return ''; }
+  })();
+  const subject = String(message.getSubject ? message.getSubject() : '');
+
+  let body = '';
+  try {
+    body = String(message.getPlainBody ? message.getPlainBody() : '');
+  } catch (error) {
+    body = '';
+  }
+  if (body.length > EMAIL_FILTER_BODY_LIMIT) {
+    body = body.slice(0, EMAIL_FILTER_BODY_LIMIT);
+  }
+
+  const deliveredTo = getMessageHeaderSafe(message, 'Delivered-To');
+  const forwardedForHeader = getMessageHeaderSafe(message, 'X-Forwarded-For') ||
+    getMessageHeaderSafe(message, 'X-Forwarded-To');
+  const originalSenderHeader = getMessageHeaderSafe(message, 'X-Original-Sender') ||
+    getMessageHeaderSafe(message, 'X-Original-From');
+
+  const envelope = parseForwardedEnvelope(body);
+
+  // Which delegated mailbox, if any, this reached us through.
+  const delegatedCandidates = [from, to, cc, deliveredTo, forwardedForHeader]
+    .map(extractEmailAddress)
+    .filter(Boolean);
+  let forwardedFrom = '';
+  for (let i = 0; i < delegated.length && !forwardedFrom; i++) {
+    if (delegatedCandidates.indexOf(delegated[i]) >= 0) {
+      forwardedFrom = delegated[i];
+    }
+  }
+
+  const originalFrom = (envelope && envelope.from) || originalSenderHeader || '';
+  const originalSubject = (envelope && envelope.subject) || stripForwardPrefixes(subject);
+  const isForwarded = !!envelope ||
+    !!forwardedForHeader ||
+    FORWARD_SUBJECT_PREFIX_PATTERN.test(subject);
+
+  // Look through the forward only when we actually found someone behind it.
+  const effectiveFrom = originalFrom || from;
+  const effectiveSubject = originalSubject || subject;
+
+  const attachmentNames = (attachments || []).map(function(attachment) {
+    try { return String(attachment.getName() || ''); } catch (error) { return ''; }
+  }).filter(Boolean);
+
+  return {
+    from: from,
+    fromAddress: extractEmailAddress(from),
+    to: to,
+    cc: cc,
+    replyTo: replyTo,
+    deliveredTo: deliveredTo,
+    forwardedFrom: forwardedFrom,
+    subject: subject,
+    body: body,
+    originalFrom: originalFrom,
+    originalSubject: originalSubject,
+    originalTo: (envelope && envelope.to) || '',
+    originalDate: (envelope && envelope.date) || '',
+    effectiveFrom: effectiveFrom,
+    effectiveFromAddress: extractEmailAddress(effectiveFrom),
+    effectiveSubject: effectiveSubject,
+    isForwarded: isForwarded,
+    isDelegatedForward: !!forwardedFrom && isForwarded,
+    attachmentNames: attachmentNames
+  };
+}
+
+/* ─── rule evaluation ─────────────────────────────────────────────────────── */
+
+/**
+ * The text(s) a rule looks at. Returns an array because attachmentName has one
+ * value per attachment and any of them may match.
+ */
+function emailFilterFieldValues(context, field) {
+  switch (field) {
+    case 'attachmentName':
+      return context.attachmentNames.slice();
+    case 'any':
+      return [[
+        context.from,
+        context.to,
+        context.cc,
+        context.deliveredTo,
+        context.replyTo,
+        context.subject,
+        context.originalFrom,
+        context.originalSubject,
+        context.attachmentNames.join(' '),
+        context.body
+      ].filter(Boolean).join('\n')];
+    default:
+      return [String(context[field] === undefined || context[field] === null ? '' : context[field])];
+  }
+}
+
+function emailFilterValueMatches(haystack, rule) {
+  const text = String(haystack || '');
+  const needle = String(rule.value || '');
+
+  switch (rule.operator) {
+    case 'isEmpty':
+      return text.trim() === '';
+    case 'isNotEmpty':
+      return text.trim() !== '';
+    case 'domainIs': {
+      const wanted = needle.toLowerCase().replace(/^@/, '').trim();
+      if (!wanted) return false;
+      const domain = extractEmailDomain(text);
+      return !!domain && (domain === wanted || domain.endsWith('.' + wanted));
+    }
+    case 'regex': {
+      try {
+        return new RegExp(needle, rule.caseSensitive ? '' : 'i').test(text);
+      } catch (error) {
+        return false;
+      }
+    }
+    default: {
+      const subject = rule.caseSensitive ? text : text.toLowerCase();
+      const term = rule.caseSensitive ? needle : needle.toLowerCase();
+      if (rule.operator === 'equals') return subject.trim() === term.trim();
+      if (rule.operator === 'startsWith') return subject.trim().indexOf(term) === 0;
+      if (rule.operator === 'endsWith') return subject.trim().lastIndexOf(term) === subject.trim().length - term.length && term.length > 0;
+      if (rule.operator === 'notContains') return subject.indexOf(term) === -1;
+      return subject.indexOf(term) >= 0;
+    }
+  }
+}
+
+function evaluateEmailFilterRule(rule, context) {
+  const values = emailFilterFieldValues(context, rule.field);
+  if (values.length === 0) {
+    // No attachments to test against: emptiness checks still have an answer.
+    return rule.operator === 'isEmpty';
+  }
+  for (let i = 0; i < values.length; i++) {
+    if (emailFilterValueMatches(values[i], rule)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Walk the rules in order; the first match decides.
+ *
+ * Returns { action, reason, rule } where action is 'accept', 'skip' or
+ * 'review'. The rule is carried back so the UI and the activity feed can name
+ * exactly what made the decision.
+ */
+function evaluateEmailFilters(context, filters) {
+  const settings = filters || getEmailFilters();
+
+  if (settings.enabled === false) {
+    return { action: 'accept', reason: 'Filtering is turned off', rule: null };
+  }
+
+  const rules = settings.rules || [];
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i];
+    if (!rule || rule.enabled === false) continue;
+    if (!evaluateEmailFilterRule(rule, context)) continue;
+
+    return {
+      action: rule.action === 'accept' ? 'accept' : 'skip',
+      reason: `Rule ${i + 1} — ${rule.name}`,
+      rule: rule
+    };
+  }
+
+  const fallback = settings.defaultAction || 'review';
+  return {
+    action: fallback,
+    reason: fallback === 'accept'
+      ? 'No rule matched; default is to process'
+      : (fallback === 'skip'
+        ? 'No rule matched; default is to skip'
+        : 'No rule matched; default is to queue for review'),
+    rule: null
+  };
+}
+
+/**
+ * Save an undecided message's attachments into the source folder and queue
+ * them for review.
+ *
+ * This is what `defaultAction: 'review'` does. The point is that a message the
+ * rules cannot classify is never silently dropped and never silently posted —
+ * it lands in the review queue with the sender and subject the rules saw, so
+ * the next filter rule can be written from a real example.
+ */
+function queueGmailAttachmentsForReview(message, attachments, filterContext, decision, config) {
+  const runtimeConfig = config || getConfig();
+  const result = { ok: true, queued: 0 };
+
+  if (!runtimeConfig.SOURCE_FOLDERS || runtimeConfig.SOURCE_FOLDERS.length === 0) {
+    appendProcessingFeed('warning', `Cannot queue "${filterContext.subject}" for review — no source folder configured.`, {
+      subject: filterContext.subject
+    });
+    return { ok: false, queued: 0 };
+  }
+
+  const sourceFolder = DriveApp.getFolderById(runtimeConfig.SOURCE_FOLDERS[0]);
+
+  for (let i = 0; i < attachments.length; i++) {
+    const attachment = attachments[i];
+    try {
+      const created = sourceFolder.createFile(attachment.copyBlob().setName(attachment.getName()));
+
+      if (isArchiveMimeType(attachment.getContentType(), attachment.getName())) {
+        const expansion = expandArchiveFileInPlace(created, sourceFolder);
+        expansion.created.forEach(function(entryFile) {
+          webExtractForReview(entryFile.getId());
+          result.queued += 1;
+        });
+      } else {
+        webExtractForReview(created.getId());
+        result.queued += 1;
+      }
+    } catch (error) {
+      result.ok = false;
+      appendProcessingFeed('error', `Could not queue ${attachment.getName()} for review`, { error: error.message });
+    }
+  }
+
+  appendProcessingFeed('warning', `Queued for review — could not classify "${filterContext.subject}" (${decision.reason})`, {
+    from: filterContext.from,
+    effectiveFrom: filterContext.effectiveFrom,
+    effectiveSubject: filterContext.effectiveSubject,
+    isDelegatedForward: filterContext.isDelegatedForward,
+    queued: result.queued
+  });
+
+  return result;
+}
+
+/* ─── web endpoints ───────────────────────────────────────────────────────── */
+
+function webGetEmailFilters() {
+  const filters = getEmailFilters();
+  return {
+    ok: true,
+    filters: filters,
+    previewQuery: buildGmailSearchQuery(filters.fetch),
+    fields: EMAIL_FILTER_FIELDS,
+    operators: EMAIL_FILTER_OPERATORS,
+    defaultActions: EMAIL_FILTER_DEFAULT_ACTIONS
+  };
+}
+
+function webSaveEmailFilters(payload) {
+  try {
+    const saved = saveEmailFilters(payload);
+    appendProcessingFeed('info', 'Email filters updated.', {
+      ruleCount: saved.rules.length,
+      defaultAction: saved.defaultAction,
+      query: buildGmailSearchQuery(saved.fetch)
+    });
+    return {
+      ok: true,
+      filters: saved,
+      previewQuery: buildGmailSearchQuery(saved.fetch),
+      message: 'Filters saved.'
+    };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+function webResetEmailFilters() {
+  const saved = saveEmailFilters(DEFAULT_EMAIL_FILTERS);
+  appendProcessingFeed('info', 'Email filters reset to defaults.', {});
+  return {
+    ok: true,
+    filters: saved,
+    previewQuery: buildGmailSearchQuery(saved.fetch),
+    message: 'Filters reset to defaults.'
+  };
+}
+
+/**
+ * Preview the Gmail query a set of unsaved settings would produce, so the UI
+ * can show it live while someone is editing.
+ */
+function webPreviewEmailFilterQuery(fetchSettings) {
+  try {
+    return { ok: true, query: buildGmailSearchQuery(normalizeEmailFilters({ fetch: fetchSettings }).fetch) };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+/**
+ * Run a set of filters (saved or unsaved) against real mail and report what
+ * each message would do, including which rule decided.
+ *
+ * `broad` widens the search past the fetch settings so the messages currently
+ * being MISSED are visible too — the fetch query alone can only ever show what
+ * already gets through.
+ */
+function webTestEmailFilters(options) {
+  try {
+    const opts = options || {};
+    const filters = opts.filters ? normalizeEmailFilters(opts.filters) : getEmailFilters();
+    const limit = Math.max(1, Math.min(Number(opts.limit) || 25, 100));
+
+    const fetchQuery = buildGmailSearchQuery(filters.fetch);
+    const days = normalizeNewerThanDays(filters.fetch.newerThanDays) || 30;
+    const query = opts.broad ? `has:attachment newer_than:${days}d` : fetchQuery;
+
+    const threads = GmailApp.search(query, 0, limit);
+    const results = [];
+    const counts = { accept: 0, skip: 0, review: 0, noAttachments: 0 };
+
+    for (let ti = 0; ti < threads.length && results.length < limit; ti++) {
+      const messages = threads[ti].getMessages();
+      for (let mi = 0; mi < messages.length && results.length < limit; mi++) {
+        const message = messages[mi];
+        const attachments = message.getAttachments().filter(isIngestibleInvoiceAttachment);
+
+        if (attachments.length === 0) {
+          counts.noAttachments += 1;
+          continue;
+        }
+
+        const context = buildMessageFilterContext(message, attachments, filters);
+        const decision = evaluateEmailFilters(context, filters);
+        counts[decision.action] = (counts[decision.action] || 0) + 1;
+
+        results.push({
+          messageId: message.getId(),
+          date: message.getDate ? message.getDate().toISOString() : null,
+          unread: message.isUnread ? message.isUnread() : null,
+          from: context.from,
+          effectiveFrom: context.effectiveFrom,
+          subject: context.subject,
+          effectiveSubject: context.effectiveSubject,
+          deliveredTo: context.deliveredTo,
+          forwardedFrom: context.forwardedFrom,
+          isForwarded: context.isForwarded,
+          isDelegatedForward: context.isDelegatedForward,
+          attachmentNames: context.attachmentNames,
+          action: decision.action,
+          reason: decision.reason,
+          ruleId: decision.rule ? decision.rule.id : null,
+          ruleName: decision.rule ? decision.rule.name : null
+        });
+      }
+    }
+
+    return {
+      ok: true,
+      query: query,
+      fetchQuery: fetchQuery,
+      broad: !!opts.broad,
+      threadsScanned: threads.length,
+      counts: counts,
+      results: results
+    };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+}
+
+/**
+ * The account's Gmail labels, so the label field can be a picker rather than a
+ * string anyone has to spell exactly right.
+ */
+function webListGmailLabels() {
+  try {
+    return {
+      ok: true,
+      labels: GmailApp.getUserLabels().map(function(label) { return label.getName(); }).sort()
+    };
+  } catch (error) {
+    return { ok: false, error: error.message, labels: [] };
+  }
+}
+
+/**
+ * Suggest delegated mailboxes by looking at what recent mail was delivered to
+ * or forwarded through. Saves the user hunting for the exact address.
+ */
+function webSuggestDelegatedMailboxes() {
+  try {
+    const threads = GmailApp.search('has:attachment newer_than:30d', 0, 40);
+    const counts = {};
+    const myAddress = extractEmailAddress(Session.getActiveUser().getEmail());
+
+    threads.forEach(function(thread) {
+      thread.getMessages().forEach(function(message) {
+        const candidates = [
+          getMessageHeaderSafe(message, 'X-Forwarded-For'),
+          getMessageHeaderSafe(message, 'X-Forwarded-To'),
+          getMessageHeaderSafe(message, 'Delivered-To'),
+          message.getTo ? message.getTo() : ''
+        ];
+        const envelope = parseForwardedEnvelope(message.getPlainBody ? message.getPlainBody() : '');
+        if (envelope && envelope.to) candidates.push(envelope.to);
+
+        candidates.forEach(function(candidate) {
+          String(candidate || '').split(/[,;]/).forEach(function(part) {
+            const address = extractEmailAddress(part);
+            if (!address || address === myAddress) return;
+            counts[address] = (counts[address] || 0) + 1;
+          });
+        });
+      });
+    });
+
+    const suggestions = Object.keys(counts)
+      .map(function(address) { return { address: address, seen: counts[address] }; })
+      .sort(function(a, b) { return b.seen - a.seen; })
+      .slice(0, 10);
+
+    return { ok: true, suggestions: suggestions };
+  } catch (error) {
+    return { ok: false, error: error.message, suggestions: [] };
+  }
+}
+
 function processIncomingPDFs() {
   if (!ENABLE_GMAIL_INGESTION) {
     const summary = {
@@ -1360,6 +2332,8 @@ function processIncomingPDFs() {
   const config = getConfig();
   assertRequiredConfig(config, ['SEARCH_QUERY', 'PROCESSED_FOLDER_ID', 'SHEET_ID', 'TARGET_EMAIL']);
   const processedFolder = DriveApp.getFolderById(config.PROCESSED_FOLDER_ID);
+  const filters = getEmailFilters();
+  const searchQuery = buildGmailSearchQuery(filters.fetch);
 
   const summary = {
     channel: 'gmail',
@@ -1373,16 +2347,18 @@ function processIncomingPDFs() {
     inProgressSkipped: 0,
     finalized: 0,
     summaryFilesCreated: 0,
-    messagesMarkedRead: 0
+    messagesMarkedRead: 0,
+    filteredOut: 0,
+    queuedForReview: 0
   };
   const startedAt = Date.now();
   let handledCount = 0;
   let stoppedEarly = false;
 
-  const threads = GmailApp.search(config.SEARCH_QUERY);
+  const threads = GmailApp.search(searchQuery);
   summary.threads = threads.length;
-  summary.searchQuery = config.SEARCH_QUERY;
-  appendProcessingFeed('info', `Gmail search: "${config.SEARCH_QUERY}" → ${threads.length} thread(s) found`, { searchQuery: config.SEARCH_QUERY, threadCount: threads.length });
+  summary.searchQuery = searchQuery;
+  appendProcessingFeed('info', `Gmail search: "${searchQuery}" → ${threads.length} thread(s) found`, { searchQuery: searchQuery, threadCount: threads.length });
 
   for (let ti = 0; ti < threads.length; ti++) {
     if (stoppedEarly) break;
@@ -1395,11 +2371,54 @@ function processIncomingPDFs() {
         continue;
       }
 
+      // Checked per message, not just per attachment: the filter branches below
+      // return early, and queueing for review costs an OCR pass each.
+      if (handledCount >= MAX_INVOICES_PER_RUN || (Date.now() - startedAt) >= MAX_BATCH_RUN_MS) {
+        stoppedEarly = true;
+        break;
+      }
+
       summary.unreadMessages += 1;
       const invoiceAttachments = message.getAttachments().filter(isIngestibleInvoiceAttachment);
       if (invoiceAttachments.length === 0) {
         message.markRead();
         summary.messagesMarkedRead += 1;
+        continue;
+      }
+
+      // Decide on the MESSAGE before opening its attachments. The context has
+      // the forward already unwrapped, so a rule can key on the carrier that
+      // actually sent the invoice rather than the delegated mailbox that
+      // relayed it — which is the only way to tell inbound from outbound here.
+      const filterContext = buildMessageFilterContext(message, invoiceAttachments, filters);
+      const decision = evaluateEmailFilters(filterContext, filters);
+
+      if (decision.action === 'skip') {
+        summary.filteredOut += 1;
+        appendProcessingFeed('info', `Filtered out: "${filterContext.subject}" — ${decision.reason}`, {
+          from: filterContext.from,
+          effectiveFrom: filterContext.effectiveFrom,
+          subject: filterContext.subject,
+          effectiveSubject: filterContext.effectiveSubject,
+          isDelegatedForward: filterContext.isDelegatedForward,
+          reason: decision.reason,
+          ruleId: decision.rule ? decision.rule.id : null
+        });
+        if (filters.markRejectedRead) {
+          message.markRead();
+          summary.messagesMarkedRead += 1;
+        }
+        continue;
+      }
+
+      if (decision.action === 'review') {
+        const queued = queueGmailAttachmentsForReview(message, invoiceAttachments, filterContext, decision, config);
+        summary.queuedForReview += queued.queued;
+        handledCount += queued.queued;
+        if (queued.ok) {
+          message.markRead();
+          summary.messagesMarkedRead += 1;
+        }
         continue;
       }
 
@@ -4566,7 +5585,9 @@ function getConfig() {
   const carrierTypeFixesRaw = properties.getProperty(PROPERTY_KEYS.CARRIER_TYPE_FIXES) || DEFAULTS.CARRIER_TYPE_FIXES;
 
   return {
-    SEARCH_QUERY: (properties.getProperty(PROPERTY_KEYS.SEARCH_QUERY) || DEFAULTS.SEARCH_QUERY).replace(/label:ITBP\b/g, 'label:Automation-Emails/ITBP'),
+    // Derived from the saved email filters so the Filters tab is the single
+    // place a query is defined; the stored property is only a cache of it.
+    SEARCH_QUERY: buildGmailSearchQuery(getEmailFilters().fetch),
     SOURCE_FOLDERS: parseFolderIds(sourceFoldersRaw),
     SOURCE_FOLDERS_RAW: sourceFoldersRaw,
     PROCESSED_FOLDER_ID: properties.getProperty(PROPERTY_KEYS.PROCESSED_FOLDER_ID) || DEFAULTS.PROCESSED_FOLDER_ID,

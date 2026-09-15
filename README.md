@@ -8,6 +8,7 @@ Google Apps Script automation for inbound freight invoices — PDFs, Excel workb
 - Unpacks zip archives (including nested ones) into their individual invoices before processing
 - OCRs and extracts invoice metadata
 - Supports manual extraction mapping profiles for hard-to-parse invoice formats (like Arrive)
+- Separates inbound from outbound mail forwarded by a delegated mailbox, by reading the original sender/subject out of the forward
 - Applies routing/coding rules
 - Logs to a Google Sheet
 - Sends an email with original PDF + generated coded summary PDF
@@ -33,13 +34,13 @@ Default folder IDs:
 	- `TARGET_EMAIL`
 	- `SHEET_ID`
 	- `SHEET_NAME` (defaults to `Invoice Logger`)
-	- `SEARCH_QUERY` (defaults to unread attachment inbox query)
 	- `RUN_INTERVAL_MINUTES` (defaults to `15`)
 5. Click **Create / Reset Triggers** from the web app.
 
 ## Web App tabs
 - **Dashboard**: run processing actions, view last run summary, and monitor live feed.
 - **Upload**: upload new invoices (`.pdf`, `.xlsx`, `.csv`, `.zip`) and optionally process immediately.
+- **Email Filters**: unwrap forwarded mail, edit inbound/outbound rules, and test them against real mail.
 - **Mapping Studio**: create/edit/delete profile-based extraction rules, install one-click Arrive template, and preview rules against source files.
 - **Configuration**: manage all runtime settings.
 
@@ -99,6 +100,79 @@ log every amount as read instead.
 
 Amounts are written to the log sheet as **numbers**, not text, so `SUM` and
 pivot tables over the Amount column work.
+
+## Email filters
+
+Gmail's native filters cannot separate these two, because both arrive `From:`
+the same delegated mailbox:
+
+```
+logistics.invoices@lidl.us  ──forwards──▶  you    inbound carrier invoice  → process
+logistics.invoices@lidl.us  ──forwards──▶  you    outbound freight         → ignore
+```
+
+The original sender, subject and recipient only exist *inside* the forwarded
+body, where no Gmail rule can reach them. The **Email Filters** tab handles this
+in two stages.
+
+### 1. Forwards are unwrapped
+
+List your delegated mailboxes (there is a "Suggest from recent mail" button that
+finds them for you). When mail arrives through one of them, the forwarded
+envelope is parsed — both the Gmail `---------- Forwarded message ---------`
+block and the Outlook `From:/Sent:/To:/Subject:` block — and these fields become
+available to rules:
+
+| Field | What it holds |
+| --- | --- |
+| `effectiveFrom` / `effectiveSubject` | The **original** sender/subject on a forward, the message's own on anything else. Usually what you want. |
+| `originalFrom` / `originalSubject` | Only what was found inside the forward |
+| `from` / `subject` | What Gmail sees — the delegated mailbox and `Fwd: …` |
+| `deliveredTo`, `replyTo`, `cc`, `forwardedFrom` | Routing, including which delegated box relayed it |
+| `body`, `attachmentName`, `any` | Full text, each attachment name, everything at once |
+
+### 2. Rules decide, top to bottom
+
+Rules are checked in order and **the first one that matches wins** — nothing
+below it is considered. Each rule is an action (Process / Skip), a field, a test
+(`contains`, `does not contain`, `is exactly`, `starts with`, `ends with`,
+`matches regex`, `domain is`, `is empty`, `is not empty`) and a value. Reorder
+them with the arrows; the tester always names the single rule that decided.
+
+So the case above is one rule above another:
+
+| # | Action | Field | Test | Value |
+| --- | --- | --- | --- | --- |
+| 1 | Skip | Subject (through forward) | contains | `outbound` |
+| 2 | Process | Subject (through forward) | contains | `inbound` |
+
+When **no** rule matches, the default action applies. It ships as **Queue for
+review**: the attachments are saved to the source folder and put in the Review
+tab, so an unclassified message is never silently dropped and never posted on a
+guess. It can be set to Process or Skip instead.
+
+Skipped messages are left **unread** by default, so a rule that is too broad is
+easy to notice and undo.
+
+### Choosing what Gmail returns
+
+The tab also builds the Gmail search itself — attachments, unread, sender,
+`deliveredto:` (which catches a delegated forward without needing any label at
+all), subject, labels and an age limit — and shows the resulting query live.
+Labels are optional. There is a raw-query mode if you would rather write it
+yourself.
+
+### Testing before you commit
+
+**Test Current Search** runs the rules as they are on screen, saved or not,
+against real mail and shows what each message would do and why. **Test All
+Recent Mail** ignores your search settings and looks at everything with an
+attachment, so you can see what is currently being *missed* rather than only
+what already gets through.
+
+Your existing `SEARCH_QUERY` is migrated into these settings the first time the
+tab loads, with the default action set to Process and the content rules left
+off, so upgrading does not change what gets processed until you choose to.
 
 ## Tests
 

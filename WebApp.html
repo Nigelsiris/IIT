@@ -467,6 +467,82 @@
       font-size: 11px;
     }
 
+    /* === FILTER RULES === */
+    .rule-row {
+      display: grid;
+      grid-template-columns: 26px 92px 150px 120px 1fr 34px;
+      gap: 8px;
+      align-items: center;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      background: var(--surface);
+      margin-bottom: 8px;
+    }
+    .rule-row.disabled { opacity: .5; }
+    .rule-row select, .rule-row input[type="text"] {
+      width: 100%;
+      padding: 6px 8px;
+      font-size: 12px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      background: var(--surface);
+      color: var(--text);
+    }
+    .rule-row select:focus, .rule-row input[type="text"]:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+    .rule-order { display: flex; flex-direction: column; gap: 2px; }
+    .rule-order button {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-secondary);
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 10px;
+      line-height: 1;
+      padding: 2px 4px;
+    }
+    .rule-order button:hover { background: var(--bg); color: var(--text); }
+    .rule-name-input { font-weight: 600; }
+    .rule-head {
+      display: grid;
+      grid-template-columns: 26px 92px 150px 120px 1fr 34px;
+      gap: 8px;
+      padding: 0 10px 6px;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--text-muted);
+    }
+    @media (max-width: 1100px) {
+      .rule-row, .rule-head { grid-template-columns: 1fr; }
+      .rule-head { display: none; }
+    }
+    .query-preview {
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 10px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-xs);
+      word-break: break-all;
+      color: var(--text);
+    }
+    .chip-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .chip {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      cursor: pointer;
+    }
+    .chip:hover { border-color: var(--primary); color: var(--primary); }
+
     /* === ACTIVITY FEED === */
     .feed {
       max-height: 420px;
@@ -848,6 +924,11 @@
           <span class="nav-label">Review</span>
         </a>
 
+        <a class="nav-item" data-page="filters" onclick="navigateTo('filters')">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+          <span class="nav-label">Email Filters</span>
+        </a>
+
         <a class="nav-item" data-page="mapping" onclick="navigateTo('mapping')">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
           <span class="nav-label">Mapping Studio</span>
@@ -1107,6 +1188,198 @@
         </div>
       </div>
 
+      <!-- ──── EMAIL FILTERS ──── -->
+      <div id="page-filters" class="page">
+        <div class="page-header">
+          <h1>Email Filters</h1>
+          <div class="btn-group">
+            <button class="btn btn-secondary btn-sm" onclick="resetFilters()">Reset to Defaults</button>
+            <button class="btn btn-primary btn-sm" onclick="saveFilters()">Save Filters</button>
+          </div>
+        </div>
+
+        <div class="page-body">
+
+          <div class="card" style="margin-bottom:16px;">
+            <div class="card-header">
+              <h2>Delegated Mailboxes</h2>
+              <span class="badge badge-info">Forwarded mail</span>
+            </div>
+            <div class="card-body">
+              <div class="form-group">
+                <label class="form-label">Mailboxes that forward mail to you</label>
+                <textarea id="fltDelegated" class="form-textarea" rows="2" placeholder="logistics.invoices@lidl.us"></textarea>
+                <div class="form-hint">
+                  One address per line. When mail arrives through one of these, the original sender and
+                  subject are read out of the forwarded message, so rules below can match the carrier
+                  that actually sent the invoice instead of the mailbox that relayed it.
+                </div>
+                <div class="chip-list" id="fltDelegatedSuggestions"></div>
+                <button class="btn btn-ghost btn-sm" style="margin-top:6px;" onclick="suggestDelegated()">Suggest from recent mail</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid-2" style="margin-bottom:16px;">
+            <div class="card">
+              <div class="card-header"><h2>What to Pull from Gmail</h2></div>
+              <div class="card-body">
+                <div class="form-group">
+                  <label class="form-check">
+                    <input type="checkbox" id="fltEnabled" onchange="renderFilterQueryPreview()" />
+                    Filtering enabled
+                  </label>
+                  <div class="form-hint">Turn off to process every message the search below returns.</div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label">Query Mode</label>
+                  <select id="fltMode" class="form-select" onchange="onFilterModeChange()">
+                    <option value="builder">Build it for me</option>
+                    <option value="raw">Write the Gmail query myself</option>
+                  </select>
+                </div>
+
+                <div id="fltBuilderFields">
+                  <div class="form-group">
+                    <label class="form-check">
+                      <input type="checkbox" id="fltHasAttachment" onchange="renderFilterQueryPreview()" />
+                      Only messages with attachments
+                    </label>
+                    <label class="form-check" style="margin-top:6px;">
+                      <input type="checkbox" id="fltUnreadOnly" onchange="renderFilterQueryPreview()" />
+                      Only unread messages
+                    </label>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Delivered To</label>
+                    <textarea id="fltDeliveredTo" class="form-textarea" rows="2" oninput="renderFilterQueryPreview()" placeholder="logistics.invoices@lidl.us"></textarea>
+                    <div class="form-hint">Catches delegated forwards without needing a Gmail label. One per line.</div>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">From</label>
+                    <textarea id="fltFrom" class="form-textarea" rows="2" oninput="renderFilterQueryPreview()" placeholder="billing@arrivelogistics.com"></textarea>
+                    <div class="form-hint">One sender or domain per line. Leave blank for any sender.</div>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Subject Contains</label>
+                    <textarea id="fltSubject" class="form-textarea" rows="2" oninput="renderFilterQueryPreview()"></textarea>
+                    <div class="form-hint">One term per line. Leave blank for any subject.</div>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Gmail Labels <span style="font-weight:400;color:var(--text-muted);">(optional)</span></label>
+                    <textarea id="fltLabels" class="form-textarea" rows="2" oninput="renderFilterQueryPreview()"></textarea>
+                    <div class="form-hint">One per line. Leave blank to ignore labels entirely.</div>
+                    <div class="chip-list" id="fltLabelSuggestions"></div>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Only mail newer than (days)</label>
+                    <input id="fltNewerThan" type="number" min="0" class="form-input" oninput="renderFilterQueryPreview()" />
+                    <div class="form-hint">0 for no limit.</div>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label">Extra Gmail Terms</label>
+                    <input id="fltExtraTerms" type="text" class="form-input" oninput="renderFilterQueryPreview()" />
+                  </div>
+                </div>
+
+                <div id="fltRawFields" hidden>
+                  <div class="form-group">
+                    <label class="form-label">Gmail Query</label>
+                    <textarea id="fltRawQuery" class="form-textarea" rows="3" oninput="renderFilterQueryPreview()"></textarea>
+                  </div>
+                </div>
+
+                <div class="form-group">
+                  <label class="form-label">Resulting Gmail Search</label>
+                  <div class="query-preview" id="fltQueryPreview">&mdash;</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header"><h2>How Filters Work</h2></div>
+              <div class="card-body">
+                <p style="font-size:13px;line-height:1.7;color:var(--text-secondary);margin:0 0 12px;">
+                  Rules are checked <strong>top to bottom</strong> and the <strong>first one that
+                  matches decides</strong>. Nothing below a matching rule is considered, so put the
+                  rules you care most about at the top.
+                </p>
+                <p style="font-size:13px;line-height:1.7;color:var(--text-secondary);margin:0 0 12px;">
+                  Fields ending in <code>effective&hellip;</code> look <em>through</em> a forward:
+                  on a normal message they are its own sender and subject, and on a forward from a
+                  delegated mailbox they are the <strong>original</strong> sender and subject. Those
+                  are usually the ones you want.
+                </p>
+                <div class="form-group">
+                  <label class="form-label">If no rule matches</label>
+                  <select id="fltDefaultAction" class="form-select">
+                    <option value="review">Queue for review (safest)</option>
+                    <option value="accept">Process it</option>
+                    <option value="skip">Skip it</option>
+                  </select>
+                  <div class="form-hint">
+                    "Queue for review" saves the attachments to the source folder and puts them in the
+                    Review tab, so nothing is lost and nothing is posted on a guess.
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label class="form-check">
+                    <input type="checkbox" id="fltMarkRejectedRead" />
+                    Mark skipped messages as read
+                  </label>
+                  <div class="form-hint">
+                    Off by default: skipped mail stays unread so a wrong rule is easy to notice and undo.
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card" style="margin-bottom:16px;">
+            <div class="card-header">
+              <h2>Rules</h2>
+              <button class="btn btn-secondary btn-sm" onclick="addFilterRule()">Add Rule</button>
+            </div>
+            <div class="card-body">
+              <div class="rule-head">
+                <span>On</span>
+                <span>Action</span>
+                <span>Field</span>
+                <span>Test</span>
+                <span>Value &amp; Name</span>
+                <span></span>
+              </div>
+              <div id="fltRules"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>Test Against Real Mail</h2>
+              <div class="btn-group">
+                <button class="btn btn-secondary btn-sm" onclick="testFilters(false)">Test Current Search</button>
+                <button class="btn btn-secondary btn-sm" onclick="testFilters(true)">Test All Recent Mail</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="form-hint" style="margin-bottom:10px;">
+                Uses the rules as they are on screen, saved or not. "All recent mail" ignores the search
+                settings and looks at everything with an attachment, so you can see what is being missed.
+              </div>
+              <div id="fltTestResults">
+                <div class="empty-state" style="padding:24px;">
+                  <div class="empty-state-icon">&#128269;</div>
+                  <div class="empty-state-title">No test run yet</div>
+                  <div class="empty-state-sub">Run a test to see which messages each rule catches</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
       <!-- ──── MAPPING STUDIO ──── -->
       <div id="page-mapping" class="page">
         <div class="page-header">
@@ -1268,8 +1541,10 @@
               <div class="card-body">
                 <div class="form-group">
                   <label class="form-label">Gmail Search Query</label>
-                  <input id="cfgSearchQuery" type="text" class="form-input" />
-                  <div class="form-hint">Only used when Gmail ingestion is enabled</div>
+                  <input id="cfgSearchQuery" type="text" class="form-input" readonly />
+                  <div class="form-hint">
+                    Built from the <a href="#" onclick="navigateTo('filters');return false;">Email Filters</a> tab &mdash; edit it there.
+                  </div>
                 </div>
                 <div class="form-group">
                   <label class="form-label">Source Folder IDs</label>
@@ -1349,7 +1624,9 @@
       selectedFile: null,
       reviewQueue: [],
       activeReviewId: null,
-      activeReview: null
+      activeReview: null,
+      filters: null,
+      labelsLoaded: false
     };
 
     let pollTimer = null;
@@ -1362,6 +1639,13 @@
       const nav = document.querySelector('.nav-item[data-page="' + pageId + '"]');
       if (page) page.classList.add('active');
       if (nav) nav.classList.add('active');
+
+      // Gmail label lookup costs a round trip, so only do it once and only
+      // when the tab that uses it is actually opened.
+      if (pageId === 'filters' && !state.labelsLoaded) {
+        state.labelsLoaded = true;
+        loadGmailLabels();
+      }
     }
 
     /* ─── TOASTS ─── */
@@ -1394,6 +1678,7 @@
           state.lastRun = data.lastRun || null;
           state.feed = data.feed || [];
           state.reviewQueue = data.reviewQueue || [];
+          state.filters = (data.emailFilters && data.emailFilters.filters) || state.filters;
           renderAll();
           showToast('Data refreshed', 'success', 2000);
         })
@@ -1404,6 +1689,7 @@
     function renderAll() {
       renderStats();
       renderConfig();
+      renderFilters();
       renderLastRun();
       renderFeed();
       renderSourceFiles();
@@ -1786,7 +2072,6 @@
     /* ─── CONFIG ACTIONS ─── */
     function saveConfig() {
       var payload = {
-        searchQuery: getValue('cfgSearchQuery'),
         sourceFolders: getValue('cfgSourceFolders'),
         processedFolderId: getValue('cfgProcessedFolder'),
         carrierTypeFixes: getValue('cfgCarrierTypeFixes'),
@@ -1957,6 +2242,395 @@
     }
 
     /* ─── UTILITIES ─── */
+    /* ═══════════════════════════════════════════════════════
+       EMAIL FILTERS
+       ═══════════════════════════════════════════════════════ */
+
+    var FILTER_FIELD_LABELS = {
+      effectiveFrom: 'Sender (through forward)',
+      originalFrom: 'Original sender',
+      from: 'Sender (raw)',
+      to: 'To',
+      cc: 'Cc',
+      deliveredTo: 'Delivered to',
+      replyTo: 'Reply to',
+      forwardedFrom: 'Delegated mailbox',
+      effectiveSubject: 'Subject (through forward)',
+      originalSubject: 'Original subject',
+      subject: 'Subject (raw)',
+      body: 'Body text',
+      attachmentName: 'Attachment name',
+      any: 'Anywhere'
+    };
+
+    var FILTER_OPERATOR_LABELS = {
+      contains: 'contains',
+      notContains: 'does not contain',
+      equals: 'is exactly',
+      startsWith: 'starts with',
+      endsWith: 'ends with',
+      regex: 'matches regex',
+      domainIs: 'domain is',
+      isEmpty: 'is empty',
+      isNotEmpty: 'is not empty'
+    };
+
+    function linesToList(value) {
+      return String(value || '')
+        .split(/[\n,]/)
+        .map(function(item) { return item.trim(); })
+        .filter(Boolean);
+    }
+
+    function listToLines(value) {
+      return (value || []).join('\n');
+    }
+
+    /* ─── rendering ─── */
+    function renderFilters() {
+      var filters = state.filters;
+      if (!filters) return;
+
+      setChecked('fltEnabled', filters.enabled !== false);
+      setValue('fltDelegated', listToLines(filters.delegatedMailboxes));
+      setValue('fltMode', filters.fetch.mode || 'builder');
+      setChecked('fltHasAttachment', filters.fetch.hasAttachment !== false);
+      setChecked('fltUnreadOnly', filters.fetch.unreadOnly !== false);
+      setValue('fltDeliveredTo', listToLines(filters.fetch.deliveredToAnyOf));
+      setValue('fltFrom', listToLines(filters.fetch.fromAnyOf));
+      setValue('fltSubject', listToLines(filters.fetch.subjectAnyOf));
+      setValue('fltLabels', listToLines(filters.fetch.labels));
+      setValue('fltNewerThan', filters.fetch.newerThanDays || 0);
+      setValue('fltExtraTerms', filters.fetch.extraTerms || '');
+      setValue('fltRawQuery', filters.fetch.rawQuery || '');
+      setValue('fltDefaultAction', filters.defaultAction || 'review');
+      setChecked('fltMarkRejectedRead', filters.markRejectedRead === true);
+
+      onFilterModeChange();
+      renderFilterRules();
+      renderFilterQueryPreview();
+    }
+
+    function setChecked(id, value) {
+      var el = document.getElementById(id);
+      if (el) el.checked = !!value;
+    }
+
+    function getChecked(id) {
+      var el = document.getElementById(id);
+      return !!(el && el.checked);
+    }
+
+    function onFilterModeChange() {
+      var mode = getValue('fltMode');
+      document.getElementById('fltBuilderFields').hidden = mode === 'raw';
+      document.getElementById('fltRawFields').hidden = mode !== 'raw';
+      renderFilterQueryPreview();
+    }
+
+    function renderFilterRules() {
+      var root = document.getElementById('fltRules');
+      var rules = (state.filters && state.filters.rules) || [];
+
+      if (rules.length === 0) {
+        root.innerHTML =
+          '<div class="empty-state" style="padding:24px;">' +
+          '<div class="empty-state-icon">&#9744;</div>' +
+          '<div class="empty-state-title">No rules yet</div>' +
+          '<div class="empty-state-sub">Every message falls through to the default action</div>' +
+          '</div>';
+        return;
+      }
+
+      root.innerHTML = rules.map(function(rule, index) {
+        var fieldOptions = Object.keys(FILTER_FIELD_LABELS).map(function(field) {
+          return '<option value="' + field + '"' + (rule.field === field ? ' selected' : '') + '>' +
+            escapeHtml(FILTER_FIELD_LABELS[field]) + '</option>';
+        }).join('');
+
+        var operatorOptions = Object.keys(FILTER_OPERATOR_LABELS).map(function(op) {
+          return '<option value="' + op + '"' + (rule.operator === op ? ' selected' : '') + '>' +
+            escapeHtml(FILTER_OPERATOR_LABELS[op]) + '</option>';
+        }).join('');
+
+        var needsValue = rule.operator !== 'isEmpty' && rule.operator !== 'isNotEmpty';
+
+        return (
+          '<div class="rule-row' + (rule.enabled === false ? ' disabled' : '') + '">' +
+            '<div class="rule-order">' +
+              '<button title="Move up" onclick="moveFilterRule(' + index + ',-1)">&#9650;</button>' +
+              '<button title="Move down" onclick="moveFilterRule(' + index + ',1)">&#9660;</button>' +
+            '</div>' +
+            '<div>' +
+              '<label class="form-check" style="margin-bottom:6px;">' +
+                '<input type="checkbox"' + (rule.enabled === false ? '' : ' checked') +
+                  ' onchange="updateFilterRule(' + index + ',\'enabled\',this.checked)" />' +
+                '<span style="font-size:11px;">On</span>' +
+              '</label>' +
+              '<select onchange="updateFilterRule(' + index + ',\'action\',this.value)">' +
+                '<option value="reject"' + (rule.action === 'reject' ? ' selected' : '') + '>Skip</option>' +
+                '<option value="accept"' + (rule.action === 'accept' ? ' selected' : '') + '>Process</option>' +
+              '</select>' +
+            '</div>' +
+            '<select onchange="updateFilterRule(' + index + ',\'field\',this.value)">' + fieldOptions + '</select>' +
+            '<select onchange="updateFilterRule(' + index + ',\'operator\',this.value)">' + operatorOptions + '</select>' +
+            '<div>' +
+              '<input type="text" class="rule-name-input" value="' + escapeAttr(rule.name || '') +
+                '" placeholder="Rule name" onchange="updateFilterRule(' + index + ',\'name\',this.value)" />' +
+              (needsValue
+                ? '<input type="text" style="margin-top:6px;" value="' + escapeAttr(rule.value || '') +
+                    '" placeholder="Value to look for" onchange="updateFilterRule(' + index + ',\'value\',this.value)" />'
+                : '<div class="form-hint" style="margin-top:8px;">No value needed</div>') +
+              '<label class="form-check" style="margin-top:6px;">' +
+                '<input type="checkbox"' + (rule.caseSensitive ? ' checked' : '') +
+                  ' onchange="updateFilterRule(' + index + ',\'caseSensitive\',this.checked)" />' +
+                '<span style="font-size:11px;">Match case</span>' +
+              '</label>' +
+            '</div>' +
+            '<button class="btn btn-ghost btn-sm" title="Delete rule" onclick="deleteFilterRule(' + index + ')">&#10005;</button>' +
+          '</div>'
+        );
+      }).join('');
+    }
+
+    /* Build the filter object from whatever is on screen right now. */
+    function collectFilters() {
+      var current = state.filters || {};
+      return {
+        enabled: getChecked('fltEnabled'),
+        delegatedMailboxes: linesToList(getValue('fltDelegated')),
+        defaultAction: getValue('fltDefaultAction'),
+        markRejectedRead: getChecked('fltMarkRejectedRead'),
+        rules: (current.rules || []).slice(),
+        fetch: {
+          mode: getValue('fltMode'),
+          rawQuery: getValue('fltRawQuery'),
+          hasAttachment: getChecked('fltHasAttachment'),
+          unreadOnly: getChecked('fltUnreadOnly'),
+          deliveredToAnyOf: linesToList(getValue('fltDeliveredTo')),
+          fromAnyOf: linesToList(getValue('fltFrom')),
+          subjectAnyOf: linesToList(getValue('fltSubject')),
+          labels: linesToList(getValue('fltLabels')),
+          newerThanDays: Number(getValue('fltNewerThan')) || 0,
+          extraTerms: getValue('fltExtraTerms')
+        }
+      };
+    }
+
+    /* Preview the query locally so it updates as you type, without a round trip. */
+    function renderFilterQueryPreview() {
+      var fetchSettings = collectFilters().fetch;
+      document.getElementById('fltQueryPreview').textContent = buildQueryPreview(fetchSettings);
+    }
+
+    function buildQueryPreview(fetchSettings) {
+      if (fetchSettings.mode === 'raw') {
+        return fetchSettings.rawQuery.trim() || '(blank — the saved default will be used)';
+      }
+
+      var parts = [];
+      if (fetchSettings.hasAttachment) parts.push('has:attachment');
+      if (fetchSettings.unreadOnly) parts.push('is:unread');
+
+      var orGroup = function(prefix, values) {
+        if (!values || values.length === 0) return;
+        var terms = values.map(function(value) {
+          return prefix + ':' + (/[\s()"]/.test(value) ? '"' + value.replace(/"/g, '') + '"' : value);
+        });
+        parts.push(terms.length === 1 ? terms[0] : '(' + terms.join(' OR ') + ')');
+      };
+
+      orGroup('label', fetchSettings.labels);
+      orGroup('from', fetchSettings.fromAnyOf);
+      orGroup('deliveredto', fetchSettings.deliveredToAnyOf);
+      orGroup('subject', fetchSettings.subjectAnyOf);
+
+      if (fetchSettings.newerThanDays > 0) parts.push('newer_than:' + fetchSettings.newerThanDays + 'd');
+      if (fetchSettings.extraTerms) parts.push(fetchSettings.extraTerms.trim());
+
+      return parts.length ? parts.join(' ') : 'has:attachment is:unread';
+    }
+
+    /* ─── rule editing ─── */
+    function updateFilterRule(index, key, value) {
+      if (!state.filters || !state.filters.rules[index]) return;
+      state.filters.rules[index][key] = value;
+      if (key === 'operator' || key === 'enabled') renderFilterRules();
+    }
+
+    function addFilterRule() {
+      if (!state.filters) return;
+      state.filters.rules.push({
+        id: 'rule-' + Date.now(),
+        name: '',
+        enabled: true,
+        action: 'reject',
+        field: 'effectiveSubject',
+        operator: 'contains',
+        value: '',
+        caseSensitive: false
+      });
+      renderFilterRules();
+    }
+
+    function deleteFilterRule(index) {
+      if (!state.filters) return;
+      state.filters.rules.splice(index, 1);
+      renderFilterRules();
+    }
+
+    function moveFilterRule(index, delta) {
+      if (!state.filters) return;
+      var rules = state.filters.rules;
+      var target = index + delta;
+      if (target < 0 || target >= rules.length) return;
+      var moved = rules.splice(index, 1)[0];
+      rules.splice(target, 0, moved);
+      renderFilterRules();
+    }
+
+    /* ─── server calls ─── */
+    function saveFilters() {
+      var payload = collectFilters();
+      google.script.run
+        .withSuccessHandler(function(result) {
+          if (!result.ok) { showToast(result.error || 'Save failed.', 'error'); return; }
+          state.filters = result.filters;
+          renderFilters();
+          showToast('Filters saved. Gmail search: ' + result.previewQuery, 'success', 5000);
+        })
+        .withFailureHandler(function(err) { showToast(err.message || String(err), 'error'); })
+        .webSaveEmailFilters(payload);
+    }
+
+    function resetFilters() {
+      if (!confirm('Reset all email filters to the shipped defaults? Your current rules will be replaced.')) return;
+      google.script.run
+        .withSuccessHandler(function(result) {
+          if (!result.ok) { showToast(result.error || 'Reset failed.', 'error'); return; }
+          state.filters = result.filters;
+          renderFilters();
+          showToast('Filters reset to defaults.', 'success');
+        })
+        .withFailureHandler(function(err) { showToast(err.message || String(err), 'error'); })
+        .webResetEmailFilters();
+    }
+
+    function loadGmailLabels() {
+      google.script.run
+        .withSuccessHandler(function(result) {
+          var root = document.getElementById('fltLabelSuggestions');
+          if (!root || !result.ok || !result.labels.length) return;
+          // Values come from the user's mailbox, so they carry them in data
+          // attributes rather than being interpolated into an inline call —
+          // a label like "Bob's Invoices" would break a quoted JS string.
+          root.innerHTML = result.labels.slice(0, 20).map(function(label) {
+            return '<span class="chip" data-target="fltLabels" data-value="' + escapeAttr(label) +
+              '" onclick="appendFromChip(this)">' + escapeHtml(label) + '</span>';
+          }).join('');
+        })
+        .withFailureHandler(function() {})
+        .webListGmailLabels();
+    }
+
+    function suggestDelegated() {
+      var root = document.getElementById('fltDelegatedSuggestions');
+      root.innerHTML = '<span class="chip">Looking…</span>';
+      google.script.run
+        .withSuccessHandler(function(result) {
+          if (!result.ok || !result.suggestions.length) {
+            root.innerHTML = '<span class="chip">Nothing obvious found in the last 30 days</span>';
+            return;
+          }
+          root.innerHTML = result.suggestions.map(function(item) {
+            return '<span class="chip" data-target="fltDelegated" data-value="' + escapeAttr(item.address) +
+              '" onclick="appendFromChip(this)">' + escapeHtml(item.address) + ' &middot; ' + item.seen + '</span>';
+          }).join('');
+        })
+        .withFailureHandler(function(err) {
+          root.innerHTML = '<span class="chip">' + escapeHtml(err.message || String(err)) + '</span>';
+        })
+        .webSuggestDelegatedMailboxes();
+    }
+
+    function appendFromChip(element) {
+      appendToField(element.getAttribute('data-target'), element.getAttribute('data-value'));
+    }
+
+    function appendToField(fieldId, value) {
+      var existing = linesToList(getValue(fieldId));
+      if (existing.indexOf(value) >= 0) return;
+      existing.push(value);
+      setValue(fieldId, existing.join('\n'));
+      renderFilterQueryPreview();
+    }
+
+    function testFilters(broad) {
+      var root = document.getElementById('fltTestResults');
+      root.innerHTML = '<div style="padding:20px;"><span class="spinner"></span> Checking mail…</div>';
+
+      google.script.run
+        .withSuccessHandler(function(result) {
+          if (!result.ok) {
+            root.innerHTML = '<div class="empty-state" style="padding:24px;"><div class="empty-state-title">Test failed</div>' +
+              '<div class="empty-state-sub">' + escapeHtml(result.error || '') + '</div></div>';
+            return;
+          }
+          renderFilterTestResults(result);
+        })
+        .withFailureHandler(function(err) {
+          root.innerHTML = '<div class="empty-state" style="padding:24px;"><div class="empty-state-title">Test failed</div>' +
+            '<div class="empty-state-sub">' + escapeHtml(err.message || String(err)) + '</div></div>';
+        })
+        .webTestEmailFilters({ filters: collectFilters(), limit: 40, broad: !!broad });
+    }
+
+    function renderFilterTestResults(result) {
+      var root = document.getElementById('fltTestResults');
+
+      if (result.results.length === 0) {
+        root.innerHTML = '<div class="empty-state" style="padding:24px;">' +
+          '<div class="empty-state-title">No messages with invoice attachments found</div>' +
+          '<div class="empty-state-sub">Searched: ' + escapeHtml(result.query) + '</div></div>';
+        return;
+      }
+
+      var badgeFor = {
+        accept: '<span class="badge badge-success">Process</span>',
+        skip: '<span class="badge badge-neutral">Skip</span>',
+        review: '<span class="badge badge-warning">Review</span>'
+      };
+
+      var rows = result.results.map(function(item) {
+        var forwardNote = item.isDelegatedForward
+          ? '<div style="font-size:11px;color:var(--text-muted);">via ' + escapeHtml(item.forwardedFrom) + '</div>'
+          : (item.isForwarded ? '<div style="font-size:11px;color:var(--text-muted);">forwarded</div>' : '');
+
+        return '<tr>' +
+          '<td>' + (badgeFor[item.action] || escapeHtml(item.action)) + '</td>' +
+          '<td>' + escapeHtml(item.effectiveSubject || item.subject) +
+            (item.effectiveSubject !== item.subject
+              ? '<div style="font-size:11px;color:var(--text-muted);">arrived as: ' + escapeHtml(item.subject) + '</div>'
+              : '') + '</td>' +
+          '<td>' + escapeHtml(item.effectiveFrom) + forwardNote + '</td>' +
+          '<td>' + escapeHtml(item.attachmentNames.join(', ')) + '</td>' +
+          '<td>' + escapeHtml(item.reason) + '</td>' +
+        '</tr>';
+      }).join('');
+
+      root.innerHTML =
+        '<div class="btn-group" style="margin-bottom:12px;">' +
+          '<span class="badge badge-success">Process: ' + (result.counts.accept || 0) + '</span>' +
+          '<span class="badge badge-neutral">Skip: ' + (result.counts.skip || 0) + '</span>' +
+          '<span class="badge badge-warning">Review: ' + (result.counts.review || 0) + '</span>' +
+        '</div>' +
+        '<div class="form-hint" style="margin-bottom:10px;">Searched: <code>' + escapeHtml(result.query) + '</code>' +
+          (result.broad ? ' &mdash; ignoring your search settings so you can see what is being missed' : '') + '</div>' +
+        '<div class="table-wrap"><table class="data-table"><thead><tr>' +
+          '<th>Outcome</th><th>Subject</th><th>Sender</th><th>Attachments</th><th>Why</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+    }
+
     function getValue(id) { return document.getElementById(id).value || ''; }
     function setValue(id, val) { document.getElementById(id).value = val || ''; }
 

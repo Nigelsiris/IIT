@@ -11,6 +11,7 @@ npm test                        # all three suites
 node test/run-tests.js          # amounts, PDF field extraction, coding, carrier
 node test/run-sheet-tests.js    # spreadsheet invoices, archives
 node test/run-pipeline-tests.js # processInvoiceFile end to end, with Apps Script mocked
+node test/run-filter-tests.js   # forwarded-mail unwrapping, filter rules, Gmail query building
 ```
 
 ## Fixtures
