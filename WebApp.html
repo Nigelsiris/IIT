@@ -985,15 +985,15 @@
           <div class="grid-2">
             <div>
               <div class="card">
-                <div class="card-header"><h2>Upload PDF</h2></div>
+                <div class="card-header"><h2>Upload Invoice</h2></div>
                 <div class="card-body">
                   <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
-                    <input type="file" id="fileInput" accept="application/pdf,.pdf" onchange="handleFileSelect(this)" />
+                    <input type="file" id="fileInput" accept=".pdf,.xlsx,.xlsm,.xls,.csv,.zip,application/pdf,application/zip" onchange="handleFileSelect(this)" />
                     <div class="dropzone-icon">
                       <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                     </div>
-                    <div class="dropzone-title" id="dropzoneTitle">Drop PDF here or click to browse</div>
-                    <div class="dropzone-sub" id="dropzoneSub">Supports .pdf files</div>
+                    <div class="dropzone-title" id="dropzoneTitle">Drop a file here or click to browse</div>
+                    <div class="dropzone-sub" id="dropzoneSub">Supports .pdf, .xlsx, .csv and .zip &mdash; a zip is unpacked into its invoices</div>
                   </div>
 
                   <div style="margin-top: 16px;">
@@ -1348,7 +1348,8 @@
       feed: [],
       selectedFile: null,
       reviewQueue: [],
-      activeReviewId: null
+      activeReviewId: null,
+      activeReview: null
     };
 
     let pollTimer = null;
@@ -1475,6 +1476,16 @@
     }
 
     /* ─── SOURCE FILES ─── */
+    /* Short type tag shown against each source file. */
+    function fileKindLabel(file) {
+      if (file && file.isArchive) return 'ZIP';
+      var ext = fileExtension(file && file.name);
+      if (ext === 'xlsx' || ext === 'xlsm' || ext === 'xls') return 'XLS';
+      if (ext === 'csv') return 'CSV';
+      if (ext === 'zip') return 'ZIP';
+      return 'PDF';
+    }
+
     function renderSourceFiles() {
       var root = document.getElementById('sourceFiles');
       var sel = document.getElementById('previewFile');
@@ -1485,7 +1496,7 @@
         root.innerHTML =
           '<div class="empty-state">' +
           '<div class="empty-state-icon">&#128194;</div>' +
-          '<div class="empty-state-title">No PDFs found</div>' +
+          '<div class="empty-state-title">No invoices found</div>' +
           '<div class="empty-state-sub">Upload invoices or add files to the source folder</div>' +
           '</div>';
         countEl.textContent = '0 files';
@@ -1497,7 +1508,7 @@
       root.innerHTML = state.sourceFiles.map(function(file) {
         return (
           '<div class="file-row">' +
-            '<div class="file-icon">PDF</div>' +
+            '<div class="file-icon">' + escapeHtml(fileKindLabel(file)) + '</div>' +
             '<div class="file-info">' +
               '<div class="file-name">' + escapeHtml(file.name) + '</div>' +
               '<div class="file-meta">' + escapeHtml(file.folderName) + ' &middot; ' + formatDate(file.updatedAt) + '</div>' +
@@ -1725,7 +1736,15 @@
       }
 
       if (field === 'amount') {
-        if (/^[0-9,]+\.[0-9]{2}$/.test(text)) return { cls: 'success', label: 'High' };
+        // The backend already scored this read against the label it came from;
+        // prefer its verdict over re-guessing from the formatting here.
+        var backendConfidence = (state.activeReview && state.activeReview.extractedData &&
+          state.activeReview.extractedData.amountConfidence) || null;
+        if (backendConfidence === 'confirmed') return { cls: 'success', label: 'Confirmed' };
+        if (backendConfidence === 'high') return { cls: 'success', label: 'High' };
+        if (backendConfidence === 'medium') return { cls: 'warning', label: 'Medium' };
+        if (backendConfidence === 'low' || backendConfidence === 'none') return { cls: 'error', label: 'Check' };
+        if (/^-?[0-9,]+\.[0-9]{2}$/.test(text)) return { cls: 'success', label: 'High' };
         return { cls: 'warning', label: 'Low' };
       }
 
@@ -1803,7 +1822,7 @@
     function uploadInvoice() {
       var fileInput = document.getElementById('fileInput');
       var file = fileInput.files && fileInput.files[0];
-      if (!file) { showToast('Select a PDF file first.', 'warning'); return; }
+      if (!file) { showToast('Select a file first.', 'warning'); return; }
 
       var btn = document.getElementById('uploadBtn');
       btn.classList.add('loading');
@@ -1826,15 +1845,21 @@
             renderReviewQueue();
             renderVbFileSelect();
             fileInput.value = '';
-            document.getElementById('dropzoneTitle').textContent = 'Drop PDF here or click to browse';
-            document.getElementById('dropzoneSub').textContent = 'Supports .pdf files';
+            document.getElementById('dropzoneTitle').textContent = 'Drop a file here or click to browse';
+            document.getElementById('dropzoneSub').innerHTML = 'Supports .pdf, .xlsx, .csv and .zip &mdash; a zip is unpacked into its invoices';
+
+            var expandedCount = (result.archive && result.archive.expanded) || 0;
+            var archiveNote = expandedCount
+              ? ' (' + expandedCount + ' invoice' + (expandedCount === 1 ? '' : 's') + ' unpacked)'
+              : '';
 
             if (uploadAction === 'review' && result.reviewItem) {
-              showToast('Uploaded & sent to review: ' + result.file.name, 'success');
+              var queued = (result.reviewItems || []).length || 1;
+              showToast('Uploaded & sent to review: ' + queued + ' file' + (queued === 1 ? '' : 's') + archiveNote, 'success');
               navigateTo('review');
               openReviewItem(result.reviewItem.reviewId);
             } else {
-              showToast('Uploaded: ' + result.file.name, 'success');
+              showToast('Uploaded: ' + result.file.name + archiveNote, 'success');
             }
           })
           .withFailureHandler(function(err) {
@@ -1844,12 +1869,36 @@
           })
           .webUploadInvoiceFile({
             fileName: file.name,
-            mimeType: file.type || 'application/pdf',
+            mimeType: file.type || guessMimeType(file.name),
             base64Data: base64Data,
             action: uploadAction
           });
       };
       reader.readAsDataURL(file);
+    }
+
+    var UPLOAD_MIME_TYPES = {
+      pdf: 'application/pdf',
+      xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12',
+      xls: 'application/vnd.ms-excel',
+      csv: 'text/csv',
+      zip: 'application/zip'
+    };
+
+    function fileExtension(name) {
+      var match = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/);
+      return match ? match[1] : '';
+    }
+
+    /* Browsers leave file.type blank for .xlsx and .zip often enough that the
+       extension has to be the source of truth. */
+    function guessMimeType(name) {
+      return UPLOAD_MIME_TYPES[fileExtension(name)] || 'application/octet-stream';
+    }
+
+    function isSupportedUploadName(name) {
+      return Object.prototype.hasOwnProperty.call(UPLOAD_MIME_TYPES, fileExtension(name));
     }
 
     function handleFileSelect(input) {
@@ -1872,12 +1921,12 @@
           e.preventDefault();
           dz.classList.remove('dragover');
           var files = e.dataTransfer && e.dataTransfer.files;
-          if (files && files.length > 0 && files[0].type === 'application/pdf') {
+          if (files && files.length > 0 && isSupportedUploadName(files[0].name)) {
             var fileInput = document.getElementById('fileInput');
             fileInput.files = files;
             handleFileSelect(fileInput);
           } else {
-            showToast('Please drop a PDF file.', 'warning');
+            showToast('Drop a .pdf, .xlsx, .csv or .zip file.', 'warning');
           }
         });
       });
@@ -1979,14 +2028,43 @@
       countEl.textContent = state.reviewQueue.length + ' pending';
       root.innerHTML = state.reviewQueue.map(function(item) {
         var isActive = state.activeReviewId === item.reviewId;
+        var hold = describeHoldReason(item);
+        var extra = '';
+        if (item.invoiceCount > 1) {
+          extra = '<div class="review-item-time">' + item.invoiceCount + ' invoices in this workbook</div>';
+        }
         return (
           '<div class="review-item' + (isActive ? ' active' : '') + '" onclick="openReviewItem(\'' + escapeAttr(item.reviewId) + '\')">' +
-            '<div class="review-item-badge">Pending</div>' +
+            '<div class="review-item-badge">' + escapeHtml(hold.badge) + '</div>' +
             '<div class="review-item-name">' + escapeHtml(item.fileName) + '</div>' +
+            (hold.detail ? '<div class="review-item-time">' + escapeHtml(hold.detail) + '</div>' : '') +
+            extra +
             '<div class="review-item-time">' + formatTime(item.createdAt) + '</div>' +
           '</div>'
         );
       }).join('');
+    }
+
+    /* Why this item is sitting in the queue — the reason the backend recorded,
+       falling back to a plain "Pending" for items queued by hand. */
+    function describeHoldReason(item) {
+      var data = item.extractedData || {};
+      switch (item.heldReason) {
+        case 'unconfirmed_carrier':
+          return { badge: 'Check carrier', detail: 'Carrier "' + (item.carrierType || 'unknown') + '" is not confirmed yet' };
+        case 'low_confidence_amount':
+          return {
+            badge: 'Check amount',
+            detail: 'Amount read as ' + (data.amount || 'nothing') +
+              (data.amountLabel ? ' near "' + String(data.amountLabel).trim() + '"' : '') +
+              ' — confirm before posting'
+          };
+        case 'total_mismatch':
+          var issues = (item.reconciliation && item.reconciliation.issues) || [];
+          return { badge: 'Totals do not match', detail: issues[0] || 'Line items disagree with the declared total' };
+        default:
+          return { badge: 'Pending', detail: '' };
+      }
     }
 
     function refreshReviewQueue() {
@@ -2022,12 +2100,16 @@
       if (!item) { showToast('Review item not found.', 'error'); return; }
 
       state.activeReviewId = reviewId;
+      state.activeReview = item;
       document.getElementById('reviewDetail').style.display = 'block';
       document.getElementById('reviewDetailTitle').textContent = 'Review: ' + item.fileName;
 
-      // PDF preview via Google Drive embed
+      // Drive embed preview. Items held from a Gmail attachment have no Drive
+      // file behind them, so blank the frame instead of loading a broken embed.
       var frame = document.getElementById('reviewPdfFrame');
-      frame.src = 'https://drive.google.com/file/d/' + encodeURIComponent(item.fileId) + '/preview';
+      frame.src = item.fileId
+        ? 'https://drive.google.com/file/d/' + encodeURIComponent(item.fileId) + '/preview'
+        : 'about:blank';
 
       // Build editable form
       var formContainer = document.getElementById('reviewForm');

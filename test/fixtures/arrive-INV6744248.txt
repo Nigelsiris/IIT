@@ -1,0 +1,33 @@
+Headquarters Address Invoice
+DM Trans, LLC d/b/a
+Arrive Logistics
+7701 Metropolis Drive Load # 8523482
+Building 15 Invoice # INV6744248
+Austin, TX 78744 Date 3/21/2026
+Terms Net 30
+Due Date 4/20/2026
+Currency US Dollar
+Bill To Remit To
+LIDL USA INC. Arrive Logistics
+500 S Clark St. PO Box 207779
+Arlington, Virginia 22202 Dallas, TX 75320-07779
+888-861-0650
+Ship Date Delivery Date Pick Up # BOL # Delivery # Shipment ID PO #
+3/19/2026 3/20/2026 S113720040 224817032660
+Item Quantity Amount
+Line Haul 1 $2,700.00
+Equipment Type: Van Weight: 39,500
+Origin Address Destination Address
+SUBCO FOODS INC Lidl Distribution Center
+1150 COMMERCE DRIVE 81 Belvedere Rd
+West Chicago, Illinois 60185 Perryville, Maryland 21903
+US US
+Reference Numbers Total $2,700.00
+Rate Quote Reference Id Q113735843, PO # 224817032660, PO
+# 224817032660
+Weight: 39,500
+Amount Due $2,700.00
+3% service charge added for credit card payments. Invoices not fully paid within the payment terms indicated above will be assessed a monthly
+penalty of 1% of the balance each month until paid in full.
+Thank You
+PAY INVOICE

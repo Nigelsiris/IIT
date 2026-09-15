@@ -61,6 +61,9 @@ const FEED_LIMIT = 200;
 const MAX_INVOICES_PER_RUN = 20;
 const MAX_BATCH_RUN_MS = 5 * 60 * 1000;
 const MISSING_VALUE_LABEL = 'See Below';
+// Invoices whose total could not be tied to an explicit label are queued for a
+// human instead of being logged. Set to false to log every amount as-is.
+const HOLD_LOW_CONFIDENCE_AMOUNTS = true;
 const XLSX_MIME_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const GOOGLE_SHEETS_MIME_TYPE = 'application/vnd.google-apps.spreadsheet';
 
@@ -273,7 +276,7 @@ function webUploadInvoiceFile(payload) {
     assertRequiredConfig(config, ['SOURCE_FOLDERS']);
     const sourceFolder = DriveApp.getFolderById(config.SOURCE_FOLDERS[0]);
     const fileName = (payload.fileName || `invoice-${Date.now()}.pdf`).trim();
-    const mimeType = payload.mimeType || MimeType.PDF;
+    const mimeType = payload.mimeType || mimeTypeForFileName(fileName);
     const bytes = Utilities.base64Decode(payload.base64Data || '');
     const blob = Utilities.newBlob(bytes, mimeType, fileName);
     const created = sourceFolder.createFile(blob);
@@ -284,26 +287,61 @@ function webUploadInvoiceFile(payload) {
       sourceFolderId: sourceFolder.getId()
     });
 
-    let processed = null;
-    let reviewItem = null;
-    if (payload.action === 'review') {
-      var reviewResult = webExtractForReview(created.getId());
-      reviewItem = reviewResult.ok ? reviewResult.reviewItem : null;
-    } else if (payload.action === 'process' || payload.processNow) {
-      processed = processSpecificDriveFile(created.getId());
+    // A zip becomes the invoices it contains; everything after this point works
+    // on that list, so uploading an archive behaves like uploading its files.
+    let targetFiles = [created];
+    let archiveInfo = null;
+    if (isArchiveMimeType(mimeType, fileName)) {
+      const expansion = expandArchiveFileInPlace(created, sourceFolder);
+      archiveInfo = {
+        expanded: expansion.created.length,
+        skipped: expansion.skipped,
+        error: expansion.error
+      };
+      if (expansion.created.length === 0) {
+        return {
+          ok: false,
+          error: expansion.error
+            ? `Could not expand ${fileName}: ${expansion.error}`
+            : `${fileName} contained no PDF or spreadsheet invoices.`,
+          archive: archiveInfo,
+          sourceFiles: listSourcePdfFiles(100),
+          feed: getProcessingFeed(120)
+        };
+      }
+      targetFiles = expansion.created;
     }
 
+    const processedResults = [];
+    const reviewItems = [];
+    targetFiles.forEach(function(targetFile) {
+      if (payload.action === 'review') {
+        const reviewResult = webExtractForReview(targetFile.getId());
+        if (reviewResult.ok && reviewResult.reviewItem) {
+          reviewItems.push(reviewResult.reviewItem);
+        }
+      } else if (payload.action === 'process' || payload.processNow) {
+        processedResults.push(processSpecificDriveFile(targetFile.getId()));
+      }
+    });
+
+    const primaryFile = targetFiles[0];
     return {
       ok: true,
       file: {
-        id: created.getId(),
-        name: created.getName(),
-        url: created.getUrl(),
-        size: created.getSize(),
-        updatedAt: created.getLastUpdated().toISOString()
+        id: primaryFile.getId(),
+        name: primaryFile.getName(),
+        url: primaryFile.getUrl(),
+        size: primaryFile.getSize(),
+        updatedAt: primaryFile.getLastUpdated().toISOString()
       },
-      processed,
-      reviewItem,
+      files: targetFiles.map(function(item) {
+        return { id: item.getId(), name: item.getName(), url: item.getUrl(), size: item.getSize() };
+      }),
+      archive: archiveInfo,
+      processed: processedResults.length === 1 ? processedResults[0] : (processedResults.length ? processedResults : null),
+      reviewItem: reviewItems.length ? reviewItems[0] : null,
+      reviewItems: reviewItems,
       sourceFiles: listSourcePdfFiles(100),
       feed: getProcessingFeed(120),
       reviewQueue: getAllReviewItems()
@@ -363,6 +401,15 @@ function webExtractForReview(fileId) {
 
     appendProcessingFeed('info', 'Extracting for review: ' + fileName, { fileId: fileId });
 
+    // Spreadsheets are parsed as data, not OCR'd as pictures of text.
+    if (isSpreadsheetInvoiceMimeType(file.getMimeType(), fileName)) {
+      return extractSpreadsheetForReview(file, fileName, config);
+    }
+
+    if (isArchiveMimeType(file.getMimeType(), fileName)) {
+      return { ok: false, error: 'Archives are unpacked before review — run a Drive pass, or upload the .zip from the Upload tab.' };
+    }
+
     const extractedText = extractTextFromPdfBlob(pdfBlob, fileName);
     const parsedInvoiceData = extractInvoiceData(extractedText, fileName);
     const mappingResult = applyMappedExtraction(extractedText, fileName);
@@ -410,6 +457,70 @@ function webExtractForReview(fileId) {
   }
 }
 
+/**
+ * Queue a spreadsheet invoice for review without running it through OCR.
+ *
+ * A multi-invoice workbook is shown as a single review item summarising every
+ * invoice it holds — approving it is a decision about the file, and the split
+ * into per-invoice log rows happens at processing time.
+ */
+function extractSpreadsheetForReview(file, fileName, config) {
+  const spreadsheetData = extractSpreadsheetInvoiceData(file.getBlob(), fileName, 'Manual Review');
+  const invoices = spreadsheetData.invoices || [];
+  const reconciliation = spreadsheetData.reconciliation || { issues: [], needsReview: false };
+  const primary = invoices.length === 1 ? invoices[0].invoiceData : null;
+  const grandTotal = invoices.reduce(function(sum, invoice) {
+    return sum + Number(invoice.totalAmount || 0);
+  }, 0);
+
+  const extractedData = primary || {
+    invoiceNumber: `${invoices.length} invoices in this workbook`,
+    po: summarizeValues(invoices.map(function(invoice) { return invoice.invoiceNumber; }), 8),
+    shipDate: MISSING_VALUE_LABEL,
+    deliveryDate: MISSING_VALUE_LABEL,
+    amount: formatAmountNumber(grandTotal),
+    amountValue: grandTotal,
+    amountConfidence: reconciliation.needsReview ? 'low' : 'high',
+    origin: 'Review Required',
+    destination: 'Review Required',
+    productType: 'Spreadsheet Invoice',
+    remitInfo: `Multi-invoice workbook — ${invoices.length} invoices, ${spreadsheetData.logRows.length} coding row(s)`
+  };
+
+  const reviewId = 'rv-' + Date.now() + '-' + file.getId().slice(0, 8);
+  const reviewItem = {
+    reviewId: reviewId,
+    fileId: file.getId(),
+    fileName: fileName,
+    source: 'Manual Review',
+    ocrText: [
+      `Sheet: ${spreadsheetData.sheetName}`,
+      `Invoices found: ${invoices.length}`,
+      `Line total: ${formatAmountNumber(grandTotal)}`,
+      reconciliation.declaredTotal === null ? '' : `Declared total: ${formatAmountNumber(reconciliation.declaredTotal)}`,
+      reconciliation.issues.length ? `Issues: ${reconciliation.issues.join('; ')}` : 'Totals reconcile.'
+    ].filter(Boolean).join('\n'),
+    extractedData: extractedData,
+    appliedCoding: spreadsheetData.codingSummary,
+    carrierType: spreadsheetData.carrierType,
+    profileName: 'spreadsheet',
+    invoiceCount: invoices.length,
+    reconciliation: reconciliation,
+    heldReason: reconciliation.needsReview ? 'total_mismatch' : null,
+    createdAt: new Date().toISOString()
+  };
+
+  saveReviewItem(reviewItem);
+  appendProcessingFeed('info', `Queued spreadsheet for review: ${fileName} (${invoices.length} invoice(s))`, {
+    reviewId: reviewId,
+    invoiceCount: invoices.length,
+    issues: reconciliation.issues
+  });
+
+  return { ok: true, reviewItem: reviewItem, reviewQueue: getAllReviewItems() };
+}
+
+
 function webGetReviewQueue() {
   return { ok: true, reviewQueue: getAllReviewItems() };
 }
@@ -429,12 +540,18 @@ function webApproveReview(reviewId, editedData) {
       po: editedData.po || item.extractedData.po || MISSING_VALUE_LABEL,
       shipDate: editedData.shipDate || item.extractedData.shipDate || MISSING_VALUE_LABEL,
       deliveryDate: editedData.deliveryDate || item.extractedData.deliveryDate || MISSING_VALUE_LABEL,
-      amount: editedData.amount || item.extractedData.amount || MISSING_VALUE_LABEL,
+      amount: normalizeAmountText(editedData.amount) ||
+        normalizeAmountText(item.extractedData.amount) ||
+        MISSING_VALUE_LABEL,
       origin: editedData.origin || item.extractedData.origin || 'Review Required',
       destination: editedData.destination || item.extractedData.destination || 'Review Required',
       productType: editedData.productType || item.extractedData.productType || 'Review Required',
       remitInfo: editedData.remitInfo || item.extractedData.remitInfo || MISSING_VALUE_LABEL
     };
+
+    // A reviewer-confirmed amount is authoritative from here on.
+    invoiceData.amountValue = parseMoneyToken(invoiceData.amount);
+    invoiceData.amountConfidence = 'confirmed';
 
     // --- Record corrections for the learning engine ---
     recordCorrections(item, invoiceData, editedData);
@@ -450,7 +567,7 @@ function webApproveReview(reviewId, editedData) {
       invoiceData.po,
       invoiceData.shipDate,
       invoiceData.deliveryDate,
-      invoiceData.amount,
+      sheetAmountValue(invoiceData),
       invoiceData.origin,
       invoiceData.productType,
       invoiceData.destination,
@@ -460,10 +577,14 @@ function webApproveReview(reviewId, editedData) {
 
     const generatedCodedPdfBlob = generateHtmlPdf(invoiceData, appliedCoding, item.fileName);
 
-    const file = DriveApp.getFileById(item.fileId);
-    const pdfBlob = file.getBlob();
+    // Items held from a Gmail attachment have no Drive file behind them; the
+    // code sheet still goes out, there is just no original to re-attach.
+    const file = item.fileId ? DriveApp.getFileById(item.fileId) : null;
+    const pdfBlob = file ? file.getBlob() : null;
     const mergePairId = buildMergePairId(item.reviewId || item.fileId || item.fileName);
-    const outputBlobs = buildOutputBlobs(carrierType, item.fileName, generatedCodedPdfBlob, pdfBlob, mergePairId);
+    const outputBlobs = pdfBlob
+      ? buildOutputBlobs(carrierType, item.fileName, generatedCodedPdfBlob, pdfBlob, mergePairId)
+      : buildOutputBlobs(carrierType, item.fileName, generatedCodedPdfBlob, null, mergePairId);
 
     MailApp.sendEmail({
       to: config.TARGET_EMAIL,
@@ -476,7 +597,9 @@ function webApproveReview(reviewId, editedData) {
     outputBlobs.forEach(function(blob) {
       processedFolder.createFile(blob);
     });
-    file.setTrashed(true);
+    if (file) {
+      file.setTrashed(true);
+    }
 
     deleteReviewItem(reviewId);
     appendProcessingFeed('success', 'Approved & finalized: ' + item.fileName, {
@@ -789,6 +912,7 @@ function queueDriveFoldersForReview() {
   const config = getConfig();
   assertRequiredConfig(config, ['SOURCE_FOLDERS']);
   appendProcessingFeed('info', 'Drive review queue run started.', { sourceFolders: config.SOURCE_FOLDERS });
+  const archiveExpansion = expandArchivesInSourceFolders(config);
 
   const startedAt = Date.now();
   let handledCount = 0;
@@ -803,7 +927,9 @@ function queueDriveFoldersForReview() {
     totalFound: 0,
     queued: 0,
     alreadyQueued: 0,
-    failed: 0
+    failed: 0,
+    archivesExpanded: archiveExpansion.archives,
+    archiveEntriesFound: archiveExpansion.filesCreated
   };
 
   outer:
@@ -818,7 +944,9 @@ function queueDriveFoldersForReview() {
       }
 
       const file = files.next();
-      if (!isPdfInvoiceFile(file)) {
+      // Archives were already expanded into this folder above; anything still
+      // flagged as one failed to unpack and must not be queued as an invoice.
+      if (!isSupportedInvoiceFile(file)) {
         continue;
       }
       handledCount += 1;
@@ -850,10 +978,132 @@ function queueDriveFoldersForReview() {
   return summary;
 }
 
+/**
+ * Unpack a zip that is sitting in a Drive folder into that same folder, then
+ * trash the archive.
+ *
+ * Doing this before anything else means the rest of the tool — the review
+ * queue, the source-file list, the processing loop — only ever deals with real
+ * Drive files. The alternative (expanding in memory) leaves review items with
+ * no file to open and no original to attach.
+ *
+ * Returns { created: [File], skipped: [String], error: String|null }.
+ */
+function expandArchiveFileInPlace(file, folder) {
+  const archiveName = file.getName();
+  let expansion;
+  try {
+    expansion = expandInvoiceArchive(file.getBlob(), archiveName, 0);
+  } catch (error) {
+    appendProcessingFeed('error', `Could not expand ${archiveName}`, { error: error.message });
+    return { created: [], skipped: [], error: error.message };
+  }
+
+  if (expansion.entries.length === 0) {
+    appendProcessingFeed('warning', `Archive ${archiveName} contained no invoice files.`, {
+      archiveName: archiveName,
+      skipped: expansion.skipped.slice(0, 20)
+    });
+    return { created: [], skipped: expansion.skipped, error: null };
+  }
+
+  const created = [];
+  const archiveBase = stripInvoiceExtension(archiveName);
+
+  expansion.entries.forEach(function(entry) {
+    try {
+      // Prefix with the archive name so two zips holding "invoice.pdf" do not
+      // become indistinguishable once unpacked side by side.
+      const targetName = buildArchiveEntryFileName(archiveBase, entry.path);
+      const createdFile = folder.createFile(entry.blob.setName(targetName));
+      created.push(createdFile);
+    } catch (error) {
+      appendProcessingFeed('error', `Could not save ${entry.path} from ${archiveName}`, { error: error.message });
+    }
+  });
+
+  if (created.length !== expansion.entries.length) {
+    // Something failed to land — keep the archive so nothing is lost.
+    appendProcessingFeed('warning', `Archive ${archiveName} kept: only ${created.length}/${expansion.entries.length} entries were saved.`, {
+      archiveName: archiveName
+    });
+    return { created: created, skipped: expansion.skipped, error: 'partial_extraction' };
+  }
+
+  file.setTrashed(true);
+  appendProcessingFeed('success', `Expanded ${archiveName} into ${created.length} invoice file(s).`, {
+    archiveName: archiveName,
+    files: created.map(function(item) { return item.getName(); }).slice(0, 20),
+    skipped: expansion.skipped.slice(0, 20)
+  });
+
+  return { created: created, skipped: expansion.skipped, error: null };
+}
+
+/**
+ * "Week 12.zip" + "north/invoice-1001.pdf" -> "Week 12 - north - invoice-1001.pdf"
+ */
+function buildArchiveEntryFileName(archiveBase, entryPath) {
+  const cleanedPath = String(entryPath || 'invoice')
+    .split('/')
+    .filter(Boolean)
+    .join(' - ');
+  const name = `${archiveBase} - ${cleanedPath}`.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return name.length > 240 ? name.slice(name.length - 240) : name;
+}
+
+/**
+ * Expand every archive sitting in the configured source folders. Run before a
+ * processing or review pass so archives never reach the rest of the pipeline.
+ */
+function expandArchivesInSourceFolders(config) {
+  const runtimeConfig = config || getConfig();
+  const folderIds = runtimeConfig.SOURCE_FOLDERS || [];
+  const result = { archives: 0, filesCreated: 0, failed: 0, deferred: 0 };
+  const startedAt = Date.now();
+  // Leave most of the run's budget for actually processing what we unpack.
+  const expansionBudgetMs = Math.round(MAX_BATCH_RUN_MS / 2);
+
+  for (let i = 0; i < folderIds.length; i++) {
+    const folder = DriveApp.getFolderById(folderIds[i]);
+    // Collect first: creating files while iterating the same folder can other-
+    // wise hand the newly written entries straight back to the iterator.
+    const archives = [];
+    const iterator = folder.getFiles();
+    while (iterator.hasNext()) {
+      const file = iterator.next();
+      if (isArchiveFile(file)) {
+        archives.push(file);
+      }
+    }
+
+    for (let a = 0; a < archives.length; a++) {
+      if ((Date.now() - startedAt) >= expansionBudgetMs) {
+        result.deferred += archives.length - a;
+        appendProcessingFeed('info', `Deferred ${result.deferred} archive(s) to the next run to stay inside the runtime limit.`, {
+          folderId: folderIds[i]
+        });
+        return result;
+      }
+
+      result.archives += 1;
+      const expansion = expandArchiveFileInPlace(archives[a], folder);
+      result.filesCreated += expansion.created.length;
+      if (expansion.error) {
+        result.failed += 1;
+      }
+    }
+  }
+
+  return result;
+}
+
+
 function processDriveFolders() {
   const config = getConfig();
   assertRequiredConfig(config, ['SOURCE_FOLDERS', 'PROCESSED_FOLDER_ID', 'SHEET_ID', 'TARGET_EMAIL']);
   appendProcessingFeed('info', 'Drive processing started.', { sourceFolders: config.SOURCE_FOLDERS });
+  const archiveExpansion = expandArchivesInSourceFolders(config);
   const startedAt = Date.now();
   let handledCount = 0;
   let stoppedEarly = false;
@@ -867,7 +1117,9 @@ function processDriveFolders() {
     inProgressSkipped: 0,
     finalized: 0,
     summaryFilesCreated: 0,
-    carrierFoldersCreated: 0
+    carrierFoldersCreated: 0,
+    archivesExpanded: archiveExpansion.archives,
+    archiveEntriesFound: archiveExpansion.filesCreated
   };
 
   const processedFolder = DriveApp.getFolderById(config.PROCESSED_FOLDER_ID);
@@ -883,7 +1135,7 @@ function processDriveFolders() {
         break outer;
       }
       const file = files.next();
-      if (!isSupportedInvoiceFile(file)) {
+      if (!isIngestibleInvoiceFile(file)) {
         continue;
       }
       summary.totalFound += 1;
@@ -934,6 +1186,78 @@ function processSpecificDriveFile(fileId) {
 function processDriveFileCore(file, sourceLabel, processedFolder, carrierFolderCache, config, summary) {
   appendProcessingFeed('info', `Processing ${file.getName()}`, { fileId: file.getId(), sourceLabel });
   const processingKey = buildDriveProcessingKey(file);
+
+  // A zip is a bag of invoices, not an invoice: expand it, process each file
+  // inside, and only trash the archive once every entry has been accounted for.
+  if (isArchiveFile(file)) {
+    let archiveResult;
+    try {
+      archiveResult = processArchiveFile(
+        file.getBlob(),
+        file.getName(),
+        sourceLabel,
+        processingKey,
+        config,
+        { sendEmail: false }
+      );
+    } catch (archiveError) {
+      summary.failed += 1;
+      Logger.log(`Archive expansion failed for ${file.getName()}: ${archiveError.message}`);
+      appendProcessingFeed('error', `Could not expand ${file.getName()}`, { error: archiveError.message });
+      return;
+    }
+
+    summary.archivesExpanded = (summary.archivesExpanded || 0) + 1;
+    summary.archiveEntriesFound = (summary.archiveEntriesFound || 0) + archiveResult.counts.total;
+
+    let unfinalized = 0;
+    archiveResult.entries.forEach(function(item) {
+      const entryResult = item.result;
+      if (entryResult.ok && entryResult.status === 'processed') {
+        summary.processed += 1;
+        try {
+          finalizeProcessedOutputBlobs(entryResult, processedFolder, summary);
+          summary.finalized += 1;
+        } catch (moveError) {
+          unfinalized += 1;
+          summary.failed += 1;
+          appendProcessingFeed('error', `Finalize failed for ${item.entry.path} in ${file.getName()}`, { error: moveError.message });
+        }
+      } else if (entryResult.ok && entryResult.status === 'already_processed') {
+        summary.alreadyProcessed += 1;
+      } else if (entryResult.ok && entryResult.status === 'held_for_review') {
+        summary.heldForReview = (summary.heldForReview || 0) + 1;
+        unfinalized += 1;
+      } else if (entryResult.status === 'in_progress') {
+        summary.inProgressSkipped += 1;
+        unfinalized += 1;
+      } else {
+        summary.failed += 1;
+        unfinalized += 1;
+        appendProcessingFeed('error', `Failed ${item.entry.path} in ${file.getName()}`, {
+          status: entryResult.status,
+          error: entryResult.error || null
+        });
+      }
+    });
+
+    // Keep the archive in place while any entry still needs attention, so the
+    // originals stay reachable for review or a retry.
+    if (unfinalized === 0 && archiveResult.complete && archiveResult.counts.total > 0) {
+      file.setTrashed(true);
+      appendProcessingFeed('success', `Finalized archive ${file.getName()} (${archiveResult.counts.total} invoice(s))`, {
+        fileId: file.getId(),
+        counts: archiveResult.counts
+      });
+    } else {
+      appendProcessingFeed('warning', `Archive ${file.getName()} left in place — ${unfinalized} entr${unfinalized === 1 ? 'y' : 'ies'} still need attention.`, {
+        fileId: file.getId(),
+        counts: archiveResult.counts
+      });
+    }
+    return;
+  }
+
   const result = processInvoiceFile(file.getBlob(), file.getName(), sourceLabel, processingKey, config, file.getMimeType(), { sendEmail: false });
 
   if (result.ok && result.status === 'processed') {
@@ -1072,7 +1396,7 @@ function processIncomingPDFs() {
       }
 
       summary.unreadMessages += 1;
-      const invoiceAttachments = message.getAttachments().filter(isSupportedInvoiceAttachment);
+      const invoiceAttachments = message.getAttachments().filter(isIngestibleInvoiceAttachment);
       if (invoiceAttachments.length === 0) {
         message.markRead();
         summary.messagesMarkedRead += 1;
@@ -1091,6 +1415,59 @@ function processIncomingPDFs() {
         summary.invoiceAttachmentsFound += 1;
         summary.pdfAttachmentsFound += 1;
         const processingKey = buildGmailProcessingKey(message, attachment);
+
+        // Zipped attachments expand into their invoices; each is finalized on
+        // its own so one bad file inside cannot lose the rest.
+        if (isArchiveMimeType(attachment.getContentType(), attachment.getName())) {
+          handledCount += 1;
+          let archiveResult;
+          try {
+            archiveResult = processArchiveFile(
+              attachment.copyBlob(),
+              attachment.getName(),
+              `Gmail: ${message.getFrom()}`,
+              processingKey,
+              config,
+              { sendEmail: false }
+            );
+          } catch (archiveError) {
+            summary.failed += 1;
+            canMarkRead = false;
+            appendProcessingFeed('error', `Could not expand ${attachment.getName()}`, { error: archiveError.message });
+            continue;
+          }
+
+          summary.archivesExpanded = (summary.archivesExpanded || 0) + 1;
+          summary.archiveEntriesFound = (summary.archiveEntriesFound || 0) + archiveResult.counts.total;
+
+          archiveResult.entries.forEach(function(item) {
+            const entryResult = item.result;
+            if (entryResult.ok && entryResult.status === 'processed') {
+              summary.processed += 1;
+              try {
+                finalizeProcessedOutputBlobs(entryResult, processedFolder, summary);
+                summary.finalized += 1;
+              } catch (finalizeError) {
+                summary.failed += 1;
+                canMarkRead = false;
+                appendProcessingFeed('error', `Finalize failed for ${item.entry.path}`, { error: finalizeError.message });
+              }
+            } else if (entryResult.ok && entryResult.status === 'already_processed') {
+              summary.alreadyProcessed += 1;
+            } else if (entryResult.ok && entryResult.status === 'held_for_review') {
+              summary.heldForReview = (summary.heldForReview || 0) + 1;
+              canMarkRead = false;
+            } else if (entryResult.status === 'in_progress') {
+              summary.inProgressSkipped += 1;
+              canMarkRead = false;
+            } else {
+              summary.failed += 1;
+              canMarkRead = false;
+            }
+          });
+          continue;
+        }
+
         const result = processInvoiceFile(
           attachment.copyBlob(),
           attachment.getName(),
@@ -1152,6 +1529,227 @@ function processIncomingPDFs() {
   return summary;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ARCHIVE (.ZIP) INGESTION
+ *
+ * Carriers routinely send a week of invoices as a single zip. Previously those
+ * files were not recognised as invoices at all: they sat in the source folder
+ * untouched and silently never got processed. Now a zip is expanded and each
+ * invoice inside is processed as if it had arrived on its own, with its own
+ * idempotency key so a re-sent archive cannot double-post.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+const ZIP_MIME_TYPES = [
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/x-zip',
+  'multipart/x-zip',
+  'application/octet-stream' // what some mail clients label a .zip attachment
+];
+const MAX_ARCHIVE_DEPTH = 3;
+const MAX_ARCHIVE_ENTRIES = 100;
+
+function isArchiveMimeType(mimeType, fileName) {
+  const normalized = String(mimeType || '').toLowerCase();
+  const name = String(fileName || '');
+  if (/\.zip$/i.test(name)) return true;
+  // octet-stream only counts when the name also says zip, otherwise every
+  // unlabelled attachment would be treated as an archive.
+  if (normalized === 'application/octet-stream') return false;
+  return ZIP_MIME_TYPES.indexOf(normalized) >= 0;
+}
+
+function isArchiveFile(file) {
+  return isArchiveMimeType(file.getMimeType(), file.getName());
+}
+
+/**
+ * Best-effort MIME type for a file pulled out of a zip. Utilities.unzip() hands
+ * back blobs typed application/octet-stream, which every downstream type check
+ * would reject, so re-derive the type from the entry name.
+ */
+function mimeTypeForFileName(fileName) {
+  const name = String(fileName || '').toLowerCase();
+  if (/\.pdf$/.test(name)) return 'application/pdf';
+  if (/\.xlsx$/.test(name)) return XLSX_MIME_TYPE;
+  if (/\.xlsm$/.test(name)) return 'application/vnd.ms-excel.sheet.macroEnabled.12';
+  if (/\.xls$/.test(name)) return 'application/vnd.ms-excel';
+  if (/\.csv$/.test(name)) return 'text/csv';
+  if (/\.zip$/.test(name)) return 'application/zip';
+  return 'application/octet-stream';
+}
+
+/**
+ * Entries that are packaging noise rather than invoices.
+ */
+function isIgnorableArchiveEntry(entryName) {
+  const name = String(entryName || '');
+  if (!name) return true;
+  if (/(^|\/)__MACOSX\//.test(name)) return true;   // macOS resource forks
+  if (/(^|\/)\._/.test(name)) return true;          // AppleDouble sidecars
+  if (/(^|\/)\.DS_Store$/i.test(name)) return true;
+  if (/(^|\/)Thumbs\.db$/i.test(name)) return true;
+  if (/\/$/.test(name)) return true;                // directory entry
+  return false;
+}
+
+/**
+ * Expand a zip blob into the invoice files it contains.
+ *
+ * Nested archives are followed up to MAX_ARCHIVE_DEPTH. Each returned entry is
+ * `{ blob, name, path, mimeType }`, where `path` keeps the position inside the
+ * archive so it can be folded into the idempotency key and shown in the feed.
+ */
+function expandInvoiceArchive(archiveBlob, archiveName, depth) {
+  const currentDepth = Number(depth || 0);
+  const results = [];
+  const skipped = [];
+
+  if (currentDepth >= MAX_ARCHIVE_DEPTH) {
+    return { entries: results, skipped: [`${archiveName} (nested deeper than ${MAX_ARCHIVE_DEPTH} levels)`] };
+  }
+
+  let unzipped;
+  try {
+    // Utilities.unzip needs the blob explicitly typed as a zip.
+    unzipped = Utilities.unzip(archiveBlob.copyBlob
+      ? archiveBlob.copyBlob().setContentType('application/zip')
+      : archiveBlob.setContentType('application/zip'));
+  } catch (error) {
+    throw new Error(`Could not open archive ${archiveName}: ${error.message}`);
+  }
+
+  for (let i = 0; i < unzipped.length; i++) {
+    if (results.length >= MAX_ARCHIVE_ENTRIES) {
+      skipped.push(`${archiveName} (more than ${MAX_ARCHIVE_ENTRIES} entries)`);
+      break;
+    }
+
+    const entryBlob = unzipped[i];
+    const entryPath = entryBlob.getName();
+    if (isIgnorableArchiveEntry(entryPath)) {
+      continue;
+    }
+
+    const baseName = entryPath.split('/').pop();
+    const entryMimeType = mimeTypeForFileName(baseName);
+
+    if (isArchiveMimeType(entryMimeType, baseName)) {
+      const nested = expandInvoiceArchive(entryBlob, `${archiveName}/${baseName}`, currentDepth + 1);
+      nested.entries.forEach(function(nestedEntry) {
+        results.push({
+          blob: nestedEntry.blob,
+          name: nestedEntry.name,
+          path: `${baseName}/${nestedEntry.path}`,
+          mimeType: nestedEntry.mimeType
+        });
+      });
+      nested.skipped.forEach(function(item) { skipped.push(item); });
+      continue;
+    }
+
+    if (!isSupportedInvoiceMimeType(entryMimeType, baseName)) {
+      skipped.push(entryPath);
+      continue;
+    }
+
+    results.push({
+      blob: entryBlob.setContentType(entryMimeType).setName(baseName),
+      name: baseName,
+      path: entryPath,
+      mimeType: entryMimeType
+    });
+  }
+
+  return { entries: results, skipped: skipped };
+}
+
+/**
+ * Process every invoice inside an archive.
+ *
+ * Returns { ok, status: 'archive', entries: [...], counts } so callers can roll
+ * the per-entry outcomes into their own run summary. Each entry carries its own
+ * processing key derived from the parent key plus the entry path, so re-sending
+ * the same archive is a no-op while a *new* file inside it still gets picked up.
+ */
+function processArchiveFile(archiveBlob, archiveName, source, processingKey, config, options) {
+  const expansion = expandInvoiceArchive(archiveBlob, archiveName, 0);
+
+  if (expansion.skipped.length > 0) {
+    appendProcessingFeed('info', `Skipped ${expansion.skipped.length} non-invoice entr${expansion.skipped.length === 1 ? 'y' : 'ies'} in ${archiveName}`, {
+      archiveName: archiveName,
+      skipped: expansion.skipped.slice(0, 20)
+    });
+  }
+
+  if (expansion.entries.length === 0) {
+    appendProcessingFeed('warning', `Archive ${archiveName} contained no invoice files.`, { archiveName: archiveName });
+    return {
+      ok: true,
+      status: 'archive',
+      entries: [],
+      counts: { total: 0, processed: 0, alreadyProcessed: 0, heldForReview: 0, failed: 0, inProgress: 0 }
+    };
+  }
+
+  appendProcessingFeed('info', `Expanding ${archiveName}: ${expansion.entries.length} invoice file(s).`, {
+    archiveName: archiveName,
+    entries: expansion.entries.map(function(entry) { return entry.path; }).slice(0, 20)
+  });
+
+  const counts = { total: 0, processed: 0, alreadyProcessed: 0, heldForReview: 0, failed: 0, inProgress: 0, notReached: 0 };
+  const entryResults = [];
+  const startedAt = Date.now();
+
+  for (let i = 0; i < expansion.entries.length; i++) {
+    // Apps Script kills a run at six minutes. Stop early and leave the rest for
+    // the next pass — their idempotency keys mean nothing is reprocessed.
+    if ((Date.now() - startedAt) >= MAX_BATCH_RUN_MS) {
+      counts.notReached = expansion.entries.length - i;
+      appendProcessingFeed('info', `Paused ${archiveName} after ${i} invoice(s) to stay inside the runtime limit; ${counts.notReached} left for the next run.`, {
+        archiveName: archiveName
+      });
+      break;
+    }
+
+    const entry = expansion.entries[i];
+    const entryKey = `${processingKey}|zip:${entry.path}`;
+    counts.total += 1;
+
+    let result;
+    try {
+      result = processInvoiceFile(
+        entry.blob,
+        entry.name,
+        `${source} (in ${archiveName})`,
+        entryKey,
+        config,
+        entry.mimeType,
+        options
+      );
+    } catch (error) {
+      result = { ok: false, status: 'failed', error: error.message };
+    }
+
+    if (result.ok && result.status === 'processed') counts.processed += 1;
+    else if (result.ok && result.status === 'already_processed') counts.alreadyProcessed += 1;
+    else if (result.ok && result.status === 'held_for_review') counts.heldForReview += 1;
+    else if (result.status === 'in_progress') counts.inProgress += 1;
+    else counts.failed += 1;
+
+    entryResults.push({ entry: entry, result: result });
+  }
+
+  return {
+    ok: counts.failed === 0,
+    status: 'archive',
+    complete: counts.notReached === 0,
+    entries: entryResults,
+    counts: counts
+  };
+}
+
+
 function processPdfFile(pdfBlob, fileName, source, processingKey, config, mimeType) {
   return processInvoiceFile(pdfBlob, fileName, source, processingKey, config, mimeType || MimeType.PDF, {});
 }
@@ -1188,7 +1786,14 @@ function processInvoiceFile(fileBlob, fileName, source, processingKey, config, m
       ? normalizeCarrierType(mappingResult.values.carrierType)
       : determineCarrierType(extractedText, invoiceData, appliedCoding, fileName), runtimeConfig);
 
-    if (!isCarrierConfirmed(carrierType, runtimeConfig)) {
+    // Hold anything we are not sure about rather than logging it as fact: an
+    // unknown carrier files the invoice in the wrong place, and a shaky amount
+    // is worse — it reconciles to the wrong number and nobody notices.
+    const holdReason = !isCarrierConfirmed(carrierType, runtimeConfig)
+      ? 'unconfirmed_carrier'
+      : (shouldHoldForAmountReview(invoiceData) ? 'low_confidence_amount' : null);
+
+    if (holdReason) {
       const reviewId = 'rv-' + Date.now() + '-' + (claim.stateKey || fileName).slice(0, 8);
       saveReviewItem({
         reviewId: reviewId,
@@ -1200,12 +1805,22 @@ function processInvoiceFile(fileBlob, fileName, source, processingKey, config, m
         appliedCoding: appliedCoding,
         carrierType: carrierType,
         profileName: mappingResult.profileName || null,
-        heldReason: 'unconfirmed_carrier',
+        heldReason: holdReason,
         createdAt: new Date().toISOString()
       });
       clearProcessingState(claim);
-      appendProcessingFeed('warning', `Held for review — unconfirmed carrier: "${carrierType}" (${fileName})`, { reviewId, carrierType, fileName });
-      return { ok: true, status: 'held_for_review', carrierType, reviewId };
+      const holdMessage = holdReason === 'unconfirmed_carrier'
+        ? `Held for review — unconfirmed carrier: "${carrierType}" (${fileName})`
+        : `Held for review — amount needs checking (${invoiceData.amount}) (${fileName})`;
+      appendProcessingFeed('warning', holdMessage, {
+        reviewId,
+        carrierType,
+        fileName,
+        heldReason: holdReason,
+        amount: invoiceData.amount,
+        amountConfidence: invoiceData.amountConfidence || null
+      });
+      return { ok: true, status: 'held_for_review', carrierType, reviewId, heldReason: holdReason };
     }
 
     const sheet = getInvoiceSheet(runtimeConfig);
@@ -1217,7 +1832,7 @@ function processInvoiceFile(fileBlob, fileName, source, processingKey, config, m
       invoiceData.po,
       invoiceData.shipDate,
       invoiceData.deliveryDate,
-      invoiceData.amount,
+      sheetAmountValue(invoiceData),
       invoiceData.origin,
       invoiceData.productType,
       invoiceData.destination,
@@ -1273,24 +1888,44 @@ function processSpreadsheetInvoiceFile(fileBlob, fileName, source, claim, runtim
   try {
     const spreadsheetData = extractSpreadsheetInvoiceData(fileBlob, fileName, source);
 
-    if (!isCarrierConfirmed(spreadsheetData.carrierType, runtimeConfig)) {
+    const reconciliation = spreadsheetData.reconciliation || { issues: [], needsReview: false };
+    const invoices = spreadsheetData.invoices || [];
+
+    // Either the carrier is unknown, or the workbook does not add up. Both mean
+    // a person should look before any of this reaches the ledger.
+    const holdReason = !isCarrierConfirmed(spreadsheetData.carrierType, runtimeConfig)
+      ? 'unconfirmed_carrier'
+      : (reconciliation.needsReview ? 'total_mismatch' : null);
+
+    if (holdReason) {
       const reviewId = 'rv-' + Date.now() + '-' + (claim.stateKey || fileName).slice(0, 8);
       saveReviewItem({
         reviewId: reviewId,
-        fileId: null,
+        fileId: (claim.details && claim.details.fileId) || null,
         fileName: fileName,
         source: source,
-        ocrText: '',
-        extractedData: {},
+        ocrText: reconciliation.issues.join('\n'),
+        extractedData: invoices.length === 1 ? invoices[0].invoiceData : {},
         appliedCoding: spreadsheetData.codingSummary || '',
         carrierType: spreadsheetData.carrierType,
-        profileName: 'xlsx-shifts',
-        heldReason: 'unconfirmed_carrier',
+        profileName: 'spreadsheet',
+        heldReason: holdReason,
+        invoiceCount: invoices.length,
+        reconciliation: reconciliation,
         createdAt: new Date().toISOString()
       });
       clearProcessingState(claim);
-      appendProcessingFeed('warning', `Held for review — unconfirmed carrier: "${spreadsheetData.carrierType}" (${fileName})`, { reviewId, carrierType: spreadsheetData.carrierType, fileName });
-      return { ok: true, status: 'held_for_review', carrierType: spreadsheetData.carrierType, reviewId };
+      const holdMessage = holdReason === 'unconfirmed_carrier'
+        ? `Held for review — unconfirmed carrier: "${spreadsheetData.carrierType}" (${fileName})`
+        : `Held for review — spreadsheet totals do not reconcile (${fileName}): ${reconciliation.issues.join('; ')}`;
+      appendProcessingFeed('warning', holdMessage, {
+        reviewId,
+        carrierType: spreadsheetData.carrierType,
+        fileName,
+        heldReason: holdReason,
+        issues: reconciliation.issues
+      });
+      return { ok: true, status: 'held_for_review', carrierType: spreadsheetData.carrierType, reviewId, heldReason: holdReason };
     }
 
     const sheet = getInvoiceSheet(runtimeConfig);
@@ -1312,7 +1947,9 @@ function processSpreadsheetInvoiceFile(fileBlob, fileName, source, claim, runtim
       MailApp.sendEmail({
         to: runtimeConfig.TARGET_EMAIL,
         subject: `Processed Invoice: ${fileName}`,
-        body: `Attached are two files:\n1) Code sheet\n2) Original invoice\n\nSplit coding summary: ${spreadsheetData.codingSummary}`,
+        body: `Attached are two files:\n1) Code sheet\n2) Original invoice\n\n` +
+          `Invoices found in this file: ${invoices.length}\n` +
+          `Split coding summary: ${spreadsheetData.codingSummary}`,
         attachments: outputBlobs
       });
     }
@@ -1323,14 +1960,16 @@ function processSpreadsheetInvoiceFile(fileBlob, fileName, source, claim, runtim
       coding: spreadsheetData.codingSummary,
       carrierType: spreadsheetData.carrierType,
       mergePairId,
-      mappingProfile: 'xlsx-shifts'
+      mappingProfile: 'spreadsheet',
+      invoiceCount: invoices.length
     });
     appendProcessingFeed('success', `Processed ${fileName}`, {
       fileName,
       source,
       carrierType: spreadsheetData.carrierType,
       mergePairId,
-      mappingProfile: 'xlsx-shifts',
+      mappingProfile: 'spreadsheet',
+      invoiceCount: invoices.length,
       groupCount: spreadsheetData.logRows.length
     });
 
@@ -1436,6 +2075,14 @@ function mergeInvoiceData(baseData, mappedValues, ocrText) {
     const normalizedMappedValue = normalizeMappedValue(field, mappedValue);
     if (normalizedMappedValue && isHighConfidenceMappedValue(field, normalizedMappedValue)) {
       result[field] = normalizedMappedValue;
+      if (field === 'amount') {
+        // A mapping profile is carrier-specific and hand-authored, so an amount
+        // it produces is authoritative — keep the numeric twin in step and
+        // promote the confidence accordingly.
+        result.amountValue = parseMoneyToken(normalizedMappedValue);
+        result.amountConfidence = 'high';
+        result.amountLabel = 'mapping profile';
+      }
     }
   });
 
@@ -1462,8 +2109,9 @@ function normalizeMappedValue(field, value) {
   }
 
   if (field === 'amount') {
-    const m = text.match(/([0-9,]+\.[0-9]{2})/);
-    return m ? m[1] : '';
+    // Run the mapped text through the money parser so "$1,150.00", "1.150,00"
+    // and "(500.00)" all land as a clean signed value.
+    return normalizeAmountText(text);
   }
 
   return text;
@@ -1493,7 +2141,7 @@ function isHighConfidenceMappedValue(field, value) {
   }
 
   if (field === 'amount') {
-    return /^[0-9,]+\.[0-9]{2}$/.test(text);
+    return /^-?[0-9]+\.[0-9]{2}$/.test(text);
   }
 
   if (field === 'origin' || field === 'destination' || field === 'productType') {
@@ -1911,6 +2559,47 @@ function waitForSpreadsheetOpen(fileId, contextLabel) {
   throw new Error('Timed out waiting for spreadsheet readiness (' + contextLabel + '): ' + fileId + ' (' + lastErr + ')');
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * SPREADSHEET INVOICES
+ *
+ * The first version of this only understood one workbook shape: a tab literally
+ * named "Shifts" whose header row contained PO, Dropoff Location and Delivery
+ * Date. Anything else threw "Shifts tab not found" and the file never got
+ * processed — including the common case of a register workbook holding many
+ * invoices, one per line.
+ *
+ * What is handled now:
+ *   · any tab, found by scoring candidate header rows against column synonyms
+ *   · one invoice per workbook (line items summed), as before
+ *   · MANY invoices per workbook, grouped by an invoice-number column
+ *   · totals reconciled against the workbook's own declared total
+ *   · spreadsheet error cells (#REF!, #VALUE!) surfaced instead of read as 0
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+// Header spellings seen in the wild, normalized (lowercased, non-alphanumerics
+// stripped). Lists must stay disjoint — a spelling may only belong to one field.
+const SPREADSHEET_COLUMN_SYNONYMS = {
+  invoiceNumber: ['invoiceno', 'invoicenumber', 'invoiceid', 'invno', 'invnumber', 'inv', 'billnumber', 'billno', 'documentnumber', 'docno'],
+  deliveryDate: ['deliverydate', 'dropoffdate', 'datedelivered', 'delivereddate', 'delivered', 'dropdate', 'date'],
+  shipDate: ['shipdate', 'shippeddate', 'pickupdate', 'collectiondate', 'loaddate', 'servicedate'],
+  shipmentNumber: ['s', 'shipment', 'shipmentnumber', 'shipmentid', 'loadnumber', 'load', 'pronumber', 'pro', 'bol', 'bolnumber', 'tripnumber', 'trip'],
+  po: ['po', 'ponumber', 'purchaseorder', 'purchaseorderno', 'ordernumber', 'order', 'customerpo'],
+  pickupLocation: ['pickuplocation', 'pickup', 'origin', 'origincity', 'originlocation', 'pickupcity', 'from', 'shipfrom'],
+  dropoffLocation: ['dropofflocation', 'dropoff', 'destination', 'destinationcity', 'deliverylocation', 'dropoffcity', 'to', 'shipto'],
+  transportCost: ['transportcost', 'linehaul', 'linehaulcost', 'freight', 'freightcharge', 'basecharge', 'baserate', 'rate'],
+  accessorials: ['tolls', 'toll', 'fuelsurcharge', 'fuel', 'accessorial', 'accessorials', 'detention', 'lumper', 'othercharges', 'extracharges'],
+  total: ['total', 'totalamount', 'amount', 'amountdue', 'invoicetotal', 'grandtotal', 'totalcharge', 'charges', 'charge', 'netamount', 'totalcost', 'cost'],
+  carrier: ['carrier', 'carriername', 'vendor', 'vendorname', 'supplier', 'truckingcompany'],
+  description: ['description', 'commodity', 'product', 'producttype', 'service', 'details', 'notes']
+};
+
+const SPREADSHEET_AMOUNT_FIELDS = ['total', 'transportCost'];
+const SPREADSHEET_ERROR_CELL_PATTERN = /^#(?:REF|VALUE|DIV\/0|NAME\?|N\/A|NULL|NUM)!?/i;
+const SPREADSHEET_TOTAL_ROW_PATTERN = /^(?:grand\s*)?(?:total|subtotal|sum|totals)\b/i;
+const SPREADSHEET_SINGLE_INVOICE_KEY = '__single_invoice__';
+const SPREADSHEET_MAX_HEADER_SCAN_ROWS = 40;
+const SPREADSHEET_MAX_BLANK_STREAK = 10;
+
 function extractSpreadsheetInvoiceData(spreadsheetBlob, fileName, source) {
   const tempIds = [];
   try {
@@ -1923,27 +2612,41 @@ function extractSpreadsheetInvoiceData(spreadsheetBlob, fileName, source) {
     }
 
     tempIds.push(converted.id);
-    const spreadsheet = waitForSpreadsheetOpen(converted.id, 'xlsx invoice conversion');
+    const spreadsheet = waitForSpreadsheetOpen(converted.id, 'spreadsheet invoice conversion');
     const invoiceMeta = extractSpreadsheetInvoiceMeta(spreadsheet, fileName);
-    const shiftRows = extractSpreadsheetShiftRows(spreadsheet);
+    const table = findInvoiceTable(spreadsheet);
 
-    if (shiftRows.length === 0) {
-      throw new Error('No delivery rows found on the Shifts tab.');
+    if (!table) {
+      throw new Error('No invoice line-item table found. Expected a header row with an amount column (Total / Amount / Transport Cost) plus at least two of: PO, Invoice #, Delivery Date, Pickup Location, Dropoff Location.');
     }
 
-    const groups = groupSpreadsheetRowsByCoding(shiftRows, invoiceMeta, fileName);
-    const invoiceSummary = buildSpreadsheetInvoiceSummary(invoiceMeta, groups, fileName);
-    const codeSheetBlob = generateSpreadsheetSplitHtmlPdf(invoiceSummary, fileName);
+    const lineRows = extractSpreadsheetLineRows(table);
+    if (lineRows.rows.length === 0) {
+      throw new Error(`No invoice rows found beneath the header on "${table.sheetName}".`);
+    }
+
+    const invoices = buildSpreadsheetInvoices(lineRows.rows, invoiceMeta, fileName);
+    const reconciliation = reconcileSpreadsheetTotals(invoices, invoiceMeta, lineRows);
+    const carrierType = resolveSpreadsheetCarrier(lineRows.rows, invoiceMeta);
+    const codeSheetBlob = generateSpreadsheetSplitHtmlPdf(invoices, invoiceMeta, carrierType, reconciliation, fileName);
     const originalPdfBlob = exportSpreadsheetAsPdf(converted.id, fileName);
 
+    const logRows = [];
+    invoices.forEach(function(invoice) {
+      buildSpreadsheetLogRows(invoice, fileName, source).forEach(function(row) {
+        logRows.push(row);
+      });
+    });
+
     return {
-      carrierType: applyCarrierTypeAutoFix(invoiceSummary.carrierType),
+      carrierType: applyCarrierTypeAutoFix(carrierType),
       codeSheetBlob: codeSheetBlob,
       originalPdfBlob: originalPdfBlob,
-      codingSummary: invoiceSummary.groups.map(function(group) {
-        return `${group.rdcCode}: ${group.coding} ($${formatAmountNumber(group.totalAmount)})`;
-      }).join(' | '),
-      logRows: buildSpreadsheetLogRows(invoiceSummary, fileName, source)
+      invoices: invoices,
+      reconciliation: reconciliation,
+      sheetName: table.sheetName,
+      codingSummary: buildSpreadsheetCodingSummary(invoices),
+      logRows: logRows
     };
   } finally {
     tempIds.forEach(function(id) {
@@ -1952,80 +2655,358 @@ function extractSpreadsheetInvoiceData(spreadsheetBlob, fileName, source) {
   }
 }
 
+/**
+ * Header/summary values that live outside the line-item table: carrier details,
+ * the invoice number, and the total the workbook itself claims to be due.
+ */
 function extractSpreadsheetInvoiceMeta(spreadsheet, fileName) {
-  const invoiceSheet = findSheetByNamePattern(spreadsheet, /invoice/i);
+  const invoiceSheet = findSheetByNamePattern(spreadsheet, /invoice|summary|cover/i) || spreadsheet.getSheets()[0];
   const values = invoiceSheet ? invoiceSheet.getDataRange().getDisplayValues() : [];
-  const carrierType = applyCarrierTypeAutoFix(findLabelValue(values, /^carrier\s*:?$/i) || stripInvoiceExtension(fileName));
-  const carrierEmail = findLabelValue(values, /^email\s*:?$/i) || '';
+
+  const carrierType = applyCarrierTypeAutoFix(
+    findLabelValue(values, /^carrier\s*(?:name)?\s*:?$/i) ||
+    findLabelValue(values, /^vendor\s*(?:name)?\s*:?$/i) ||
+    stripInvoiceExtension(fileName)
+  );
+  const carrierEmail = findLabelValue(values, /^e-?mail\s*:?$/i) || '';
   const carrierAddress = [
     findLabelValue(values, /^carrier\s*address\s*:?$/i),
-    findLabelValue(values, /^address\s*:?$/i)
+    findLabelValue(values, /^address\s*:?$/i),
+    findLabelValue(values, /^remit\s*(?:to)?\s*:?$/i)
   ].filter(Boolean)[0] || '';
-  const invoiceNumber = extractInvoiceNumberFromFileName(fileName) || MISSING_VALUE_LABEL;
+
+  // Prefer the number the workbook states over one guessed from the filename.
+  const declaredInvoiceNumber =
+    findLabelValue(values, /^invoice\s*#\s*:?$/i) ||
+    findLabelValue(values, /^invoice\s*(?:no|num|number)\.?\s*[#:]?\s*:?$/i) ||
+    findLabelValue(values, /^(?:inv|bill)\s*(?:no|num|number|#)\.?\s*:?$/i) ||
+    '';
+  const invoiceNumber = declaredInvoiceNumber ||
+    extractInvoiceNumberFromFileName(fileName) ||
+    MISSING_VALUE_LABEL;
+
+  const invoiceDate =
+    findLabelValue(values, /^invoice\s*date\s*:?$/i) ||
+    findLabelValue(values, /^date\s*:?$/i) ||
+    '';
+
+  const declaredTotalRaw =
+    findLabelValue(values, /^total\s*amount\s*due\s*:?$/i) ||
+    findLabelValue(values, /^(?:grand\s*)?total\s*(?:due)?\s*:?$/i) ||
+    findLabelValue(values, /^amount\s*due\s*:?$/i) ||
+    '';
+  const declaredTotal = parseMoneyToken(declaredTotalRaw);
 
   return {
     carrierType: carrierType,
     carrierEmail: carrierEmail,
     carrierAddress: carrierAddress,
-    invoiceNumber: invoiceNumber
+    invoiceNumber: invoiceNumber,
+    invoiceDate: invoiceDate,
+    declaredTotal: declaredTotal,
+    declaredTotalRaw: declaredTotalRaw
   };
 }
 
-function extractSpreadsheetShiftRows(spreadsheet) {
-  const shiftSheet = findSheetByNamePattern(spreadsheet, /shift/i);
-  if (!shiftSheet) {
-    throw new Error('Shifts tab not found in spreadsheet invoice.');
+/**
+ * Find the line-item table anywhere in the workbook.
+ *
+ * Every row of every sheet is scored on how many known invoice columns it
+ * names; the best-scoring row that is followed by data wins. This replaces the
+ * old exact-match requirement on a tab called "Shifts".
+ */
+function findInvoiceTable(spreadsheet) {
+  const sheets = spreadsheet.getSheets();
+  let best = null;
+
+  for (let s = 0; s < sheets.length; s++) {
+    const sheet = sheets[s];
+    let range;
+    try {
+      range = sheet.getDataRange();
+    } catch (error) {
+      continue;
+    }
+
+    const displayValues = range.getDisplayValues();
+    if (displayValues.length < 2) continue;
+    const rawValues = range.getValues();
+    const scanLimit = Math.min(displayValues.length - 1, SPREADSHEET_MAX_HEADER_SCAN_ROWS);
+
+    for (let r = 0; r < scanLimit; r++) {
+      const headerMap = mapInvoiceTableColumns(displayValues[r] || []);
+      const fieldNames = Object.keys(headerMap);
+      if (fieldNames.length < 3) continue;
+
+      // Without an amount column there is nothing to code or reconcile.
+      let hasAmount = false;
+      for (let a = 0; a < SPREADSHEET_AMOUNT_FIELDS.length; a++) {
+        if (headerMap[SPREADSHEET_AMOUNT_FIELDS[a]] !== undefined) { hasAmount = true; break; }
+      }
+      if (!hasAmount) continue;
+
+      // The header must actually be followed by data.
+      let hasDataBelow = false;
+      for (let d = r + 1; d < Math.min(displayValues.length, r + 6); d++) {
+        if ((displayValues[d] || []).join('').trim() !== '') { hasDataBelow = true; break; }
+      }
+      if (!hasDataBelow) continue;
+
+      const score = fieldNames.length + (headerMap.invoiceNumber !== undefined ? 2 : 0);
+      if (!best || score > best.score) {
+        best = {
+          score: score,
+          sheetName: sheet.getName(),
+          headerIndex: r,
+          headerMap: headerMap,
+          displayValues: displayValues,
+          rawValues: rawValues
+        };
+      }
+      break; // one header row per sheet is enough
+    }
   }
 
-  const range = shiftSheet.getDataRange();
-  const displayValues = range.getDisplayValues();
-  const rawValues = range.getValues();
-  const headerIndex = findShiftHeaderRow(displayValues);
-  if (headerIndex < 0) {
-    throw new Error('Shift header row not found.');
-  }
+  return best;
+}
 
-  const headerMap = mapShiftColumns(displayValues[headerIndex] || []);
+/**
+ * Map a header row onto canonical field names.
+ * The first column claiming a field keeps it, so a stray later column cannot
+ * hijack an already-identified one.
+ */
+function mapInvoiceTableColumns(headerRow) {
+  const map = {};
+  const fields = Object.keys(SPREADSHEET_COLUMN_SYNONYMS);
+
+  (headerRow || []).forEach(function(header, index) {
+    const normalized = normalizeHeaderValue(header);
+    if (!normalized) return;
+
+    for (let f = 0; f < fields.length; f++) {
+      const field = fields[f];
+      if (map[field] !== undefined) continue;
+      if (SPREADSHEET_COLUMN_SYNONYMS[field].indexOf(normalized) >= 0) {
+        map[field] = index;
+        return;
+      }
+    }
+  });
+
+  return map;
+}
+
+/**
+ * Read the data rows beneath a table header.
+ *
+ * Returns { rows, errorCells, skippedTotalRows }. Rows carrying spreadsheet
+ * error values are kept but marked, so a broken formula shows up as a review
+ * flag instead of quietly contributing zero to the invoice total.
+ */
+function extractSpreadsheetLineRows(table) {
+  const displayValues = table.displayValues;
+  const rawValues = table.rawValues;
+  const headerMap = table.headerMap;
   const rows = [];
-  let emptyStreak = 0;
+  const errorCells = [];
+  let skippedTotalRows = 0;
+  let blankStreak = 0;
 
-  for (let rowIndex = headerIndex + 1; rowIndex < displayValues.length; rowIndex++) {
+  for (let rowIndex = table.headerIndex + 1; rowIndex < displayValues.length; rowIndex++) {
     const displayRow = displayValues[rowIndex] || [];
     const rawRow = rawValues[rowIndex] || [];
+
     if (displayRow.join('').trim() === '') {
-      emptyStreak += 1;
-      if (rows.length > 0 && emptyStreak >= 10) {
-        break;
-      }
+      blankStreak += 1;
+      if (rows.length > 0 && blankStreak >= SPREADSHEET_MAX_BLANK_STREAK) break;
       continue;
     }
-    emptyStreak = 0;
+    blankStreak = 0;
 
-    const po = getCellByIndex(displayRow, headerMap.po);
-    const pickupLocation = getCellByIndex(displayRow, headerMap.pickupLocation);
-    const dropoffLocation = getCellByIndex(displayRow, headerMap.dropoffLocation);
-    const totalAmount = parseAmountValue(
-      getRawCellByIndex(rawRow, headerMap.total),
-      getCellByIndex(displayRow, headerMap.total),
-      getRawCellByIndex(rawRow, headerMap.transportCost),
-      getCellByIndex(displayRow, headerMap.transportCost)
-    );
-
-    if (!po && !pickupLocation && !dropoffLocation && !totalAmount) {
+    // "Total" / "Grand Total" footer rows restate the sum; counting them would
+    // double the invoice.
+    let firstCell = '';
+    for (let c = 0; c < displayRow.length; c++) {
+      const cellText = String(displayRow[c] || '').trim();
+      if (cellText) { firstCell = cellText; break; }
+    }
+    if (SPREADSHEET_TOTAL_ROW_PATTERN.test(firstCell)) {
+      skippedTotalRows += 1;
       continue;
     }
 
-    rows.push({
-      deliveryDate: formatSheetDate(getRawCellByIndex(rawRow, headerMap.deliveryDate), getCellByIndex(displayRow, headerMap.deliveryDate)),
+    const amount = readSpreadsheetRowAmount(displayRow, rawRow, headerMap);
+    if (amount.errorText) {
+      errorCells.push({ row: rowIndex + 1, value: amount.errorText });
+    }
+
+    const row = {
+      rowNumber: rowIndex + 1,
+      invoiceNumber: getCellByIndex(displayRow, headerMap.invoiceNumber),
+      deliveryDate: headerMap.deliveryDate === undefined
+        ? ''
+        : formatSheetDate(getRawCellByIndex(rawRow, headerMap.deliveryDate), getCellByIndex(displayRow, headerMap.deliveryDate)),
+      shipDate: headerMap.shipDate === undefined
+        ? ''
+        : formatSheetDate(getRawCellByIndex(rawRow, headerMap.shipDate), getCellByIndex(displayRow, headerMap.shipDate)),
       shipmentNumber: getCellByIndex(displayRow, headerMap.shipmentNumber),
-      po: po,
-      pickupLocation: pickupLocation,
-      dropoffLocation: dropoffLocation,
-      totalAmount: totalAmount
-    });
+      po: getCellByIndex(displayRow, headerMap.po),
+      pickupLocation: getCellByIndex(displayRow, headerMap.pickupLocation),
+      dropoffLocation: getCellByIndex(displayRow, headerMap.dropoffLocation),
+      carrier: getCellByIndex(displayRow, headerMap.carrier),
+      description: getCellByIndex(displayRow, headerMap.description),
+      totalAmount: amount.value === null ? 0 : amount.value,
+      amountIsError: !!amount.errorText,
+      amountMissing: amount.value === null
+    };
+
+    const hasIdentity = row.invoiceNumber || row.po || row.shipmentNumber ||
+      row.pickupLocation || row.dropoffLocation;
+    if (!hasIdentity && amount.value === null) {
+      continue;
+    }
+
+    rows.push(row);
   }
 
-  return rows;
+  return { rows: rows, errorCells: errorCells, skippedTotalRows: skippedTotalRows };
+}
+
+/**
+ * The amount for one line: the explicit total column when present, otherwise
+ * transport cost plus any accessorial column.
+ * Returns { value, errorText } — value is null when nothing usable was found.
+ */
+function readSpreadsheetRowAmount(displayRow, rawRow, headerMap) {
+  const readCell = function(index) {
+    if (index === undefined) return { value: null, errorText: null };
+    const display = String(getCellByIndex(displayRow, index) || '').trim();
+    if (SPREADSHEET_ERROR_CELL_PATTERN.test(display)) {
+      return { value: null, errorText: display };
+    }
+    const raw = getRawCellByIndex(rawRow, index);
+    if (typeof raw === 'number' && !isNaN(raw)) {
+      return { value: raw, errorText: null };
+    }
+    if (typeof raw === 'string' && SPREADSHEET_ERROR_CELL_PATTERN.test(raw.trim())) {
+      return { value: null, errorText: raw.trim() };
+    }
+    return { value: parseMoneyToken(display), errorText: null };
+  };
+
+  const totalCell = readCell(headerMap.total);
+  if (totalCell.value !== null) {
+    return totalCell;
+  }
+
+  const transportCell = readCell(headerMap.transportCost);
+  const accessorialCell = readCell(headerMap.accessorials);
+  if (transportCell.value !== null || accessorialCell.value !== null) {
+    return {
+      value: (transportCell.value || 0) + (accessorialCell.value || 0),
+      errorText: totalCell.errorText || transportCell.errorText || accessorialCell.errorText
+    };
+  }
+
+  return {
+    value: null,
+    errorText: totalCell.errorText || transportCell.errorText || accessorialCell.errorText
+  };
+}
+
+/**
+ * Split the line rows into invoices.
+ *
+ * With an invoice-number column, each distinct number is its own invoice — this
+ * is the "one excel file, many invoices" case. Without one, the whole table is
+ * a single invoice, as before.
+ */
+function buildSpreadsheetInvoices(rows, invoiceMeta, fileName) {
+  const grouped = {};
+  const order = [];
+
+  rows.forEach(function(row) {
+    const key = String(row.invoiceNumber || '').trim() || SPREADSHEET_SINGLE_INVOICE_KEY;
+    if (!grouped[key]) {
+      grouped[key] = [];
+      order.push(key);
+    }
+    grouped[key].push(row);
+  });
+
+  const isMulti = order.length > 1;
+
+  return order.map(function(key) {
+    const invoiceRows = grouped[key];
+    const invoiceNumber = key === SPREADSHEET_SINGLE_INVOICE_KEY ? invoiceMeta.invoiceNumber : key;
+    const groups = groupSpreadsheetRowsByCoding(invoiceRows, invoiceMeta, fileName);
+    return buildSpreadsheetInvoiceSummary(invoiceMeta, groups, invoiceNumber, invoiceRows, isMulti);
+  });
+}
+
+/**
+ * Compare what the rows add up to against the total the workbook declares.
+ * A mismatch is the single most useful signal that a spreadsheet invoice was
+ * read wrongly, so it is surfaced rather than swallowed.
+ */
+function reconcileSpreadsheetTotals(invoices, invoiceMeta, lineRows) {
+  const computedTotal = invoices.reduce(function(sum, invoice) {
+    return sum + Number(invoice.totalAmount || 0);
+  }, 0);
+
+  const issues = [];
+  if (lineRows.errorCells.length > 0) {
+    issues.push(`${lineRows.errorCells.length} row(s) contain spreadsheet errors (${lineRows.errorCells.slice(0, 3).map(function(cell) {
+      return `row ${cell.row}: ${cell.value}`;
+    }).join('; ')})`);
+  }
+
+  let declaredTotal = null;
+  let difference = null;
+  let matches = null;
+
+  if (invoiceMeta.declaredTotal !== null && invoiceMeta.declaredTotal !== undefined) {
+    declaredTotal = invoiceMeta.declaredTotal;
+    difference = Number((computedTotal - declaredTotal).toFixed(2));
+    matches = Math.abs(difference) < 0.01;
+    if (!matches) {
+      issues.push(`Line items total ${formatAmountNumber(computedTotal)} but the invoice declares ${formatAmountNumber(declaredTotal)} (difference ${formatAmountNumber(difference)})`);
+    }
+  }
+
+  return {
+    computedTotal: computedTotal,
+    declaredTotal: declaredTotal,
+    difference: difference,
+    matches: matches,
+    errorCells: lineRows.errorCells,
+    skippedTotalRows: lineRows.skippedTotalRows,
+    issues: issues,
+    needsReview: issues.length > 0
+  };
+}
+
+/**
+ * A register listing several carriers cannot be filed under one of them; fall
+ * back to the workbook's stated carrier in that case.
+ */
+function resolveSpreadsheetCarrier(rows, invoiceMeta) {
+  const seen = {};
+  rows.forEach(function(row) {
+    const carrier = String(row.carrier || '').trim();
+    if (carrier) seen[carrier] = true;
+  });
+  const names = Object.keys(seen);
+  return names.length === 1 ? names[0] : invoiceMeta.carrierType;
+}
+
+function buildSpreadsheetCodingSummary(invoices) {
+  return invoices.map(function(invoice) {
+    const groupText = invoice.groups.map(function(group) {
+      return `${group.rdcCode}: ${group.coding} ($${formatAmountNumber(group.totalAmount)})`;
+    }).join(' | ');
+    return invoices.length > 1 ? `${invoice.invoiceNumber}: ${groupText}` : groupText;
+  }).join('  ||  ');
 }
 
 function groupSpreadsheetRowsByCoding(rows, invoiceMeta, fileName) {
@@ -2034,11 +3015,13 @@ function groupSpreadsheetRowsByCoding(rows, invoiceMeta, fileName) {
   rows.forEach(function(row) {
     const coding = determineCoding([
       invoiceMeta.carrierType,
+      row.carrier,
       row.pickupLocation,
       row.dropoffLocation,
+      row.description,
       row.po,
       fileName
-    ].join(' '));
+    ].filter(Boolean).join(' '));
     const key = coding;
     if (!grouped[key]) {
       grouped[key] = {
@@ -2046,6 +3029,7 @@ function groupSpreadsheetRowsByCoding(rows, invoiceMeta, fileName) {
         rdcCode: extractRdcCodeFromCoding(coding),
         totalAmount: 0,
         shipmentCount: 0,
+        hasErrors: false,
         poMap: {},
         pickupMap: {},
         dropoffMap: {},
@@ -2055,6 +3039,7 @@ function groupSpreadsheetRowsByCoding(rows, invoiceMeta, fileName) {
 
     grouped[key].totalAmount += Number(row.totalAmount || 0);
     grouped[key].shipmentCount += 1;
+    if (row.amountIsError || row.amountMissing) grouped[key].hasErrors = true;
     if (row.po) grouped[key].poMap[row.po] = true;
     if (row.pickupLocation) grouped[key].pickupMap[row.pickupLocation] = true;
     if (row.dropoffLocation) grouped[key].dropoffMap[row.dropoffLocation] = true;
@@ -2077,45 +3062,63 @@ function groupSpreadsheetRowsByCoding(rows, invoiceMeta, fileName) {
     });
 }
 
-function buildSpreadsheetInvoiceSummary(invoiceMeta, groups, fileName) {
+function buildSpreadsheetInvoiceSummary(invoiceMeta, groups, invoiceNumber, rows, isMulti) {
   const totalAmount = groups.reduce(function(sum, group) {
     return sum + Number(group.totalAmount || 0);
   }, 0);
   const allPOs = {};
   const allOrigins = {};
   const allDestinations = {};
-  const allDates = {};
+  const allDeliveryDates = {};
+  const allShipDates = {};
 
   groups.forEach(function(group) {
     group.poNumbers.forEach(function(po) { allPOs[po] = true; });
     group.pickupLocations.forEach(function(location) { allOrigins[location] = true; });
     group.dropoffLocations.forEach(function(location) { allDestinations[location] = true; });
-    group.deliveryDates.forEach(function(date) { allDates[date] = true; });
+    group.deliveryDates.forEach(function(date) { allDeliveryDates[date] = true; });
+  });
+  (rows || []).forEach(function(row) {
+    if (row.shipDate && row.shipDate !== MISSING_VALUE_LABEL) allShipDates[row.shipDate] = true;
   });
 
   const poNumbers = Object.keys(allPOs).sort();
   const origins = Object.keys(allOrigins).sort();
   const destinations = Object.keys(allDestinations).sort();
-  const deliveryDates = Object.keys(allDates).sort();
+  const deliveryDates = Object.keys(allDeliveryDates).sort();
+  const shipDates = Object.keys(allShipDates).sort();
+  const hasErrors = groups.some(function(group) { return group.hasErrors; });
+
   const remitBits = [];
   if (invoiceMeta.carrierAddress) remitBits.push(invoiceMeta.carrierAddress);
   if (invoiceMeta.carrierEmail) remitBits.push(invoiceMeta.carrierEmail);
   remitBits.push(`Split across ${groups.length} RDC code${groups.length === 1 ? '' : 's'}`);
+  if (isMulti) {
+    remitBits.push('One of several invoices in this workbook');
+  }
 
   return {
     carrierType: invoiceMeta.carrierType,
-    invoiceNumber: invoiceMeta.invoiceNumber,
+    invoiceNumber: invoiceNumber || invoiceMeta.invoiceNumber,
     totalAmount: totalAmount,
+    rowCount: (rows || []).length,
+    hasErrors: hasErrors,
     groups: groups,
     invoiceData: {
-      invoiceNumber: invoiceMeta.invoiceNumber,
+      invoiceNumber: invoiceNumber || invoiceMeta.invoiceNumber,
       po: summarizeValues(poNumbers, 6),
-      shipDate: MISSING_VALUE_LABEL,
+      shipDate: summarizeDateValues(shipDates),
       deliveryDate: summarizeDateValues(deliveryDates),
       amount: formatAmountNumber(totalAmount),
+      amountValue: totalAmount,
+      // Spreadsheet totals are arithmetic on real cells, not a read of printed
+      // text, so they are only ever doubted when reconciliation says so.
+      amountConfidence: hasErrors ? 'low' : 'high',
       origin: summarizeValues(origins, 3) || 'Review Required',
-      destination: groups.length > 1 ? `Multiple RDCs (${groups.length})` : (summarizeValues(destinations, 3) || 'Review Required'),
-      productType: 'XLSX Shift Invoice',
+      destination: groups.length > 1
+        ? `Multiple RDCs (${groups.length})`
+        : (summarizeValues(destinations, 3) || 'Review Required'),
+      productType: 'Spreadsheet Invoice',
       remitInfo: remitBits.join('\n')
     }
   };
@@ -2131,9 +3134,9 @@ function buildSpreadsheetLogRows(invoiceSummary, fileName, source) {
       summarizeValues(group.poNumbers, 12),
       MISSING_VALUE_LABEL,
       summarizeDateValues(group.deliveryDates),
-      formatAmountNumber(group.totalAmount),
+      Number(group.totalAmount || 0),
       summarizeValues(group.pickupLocations, 3) || 'Review Required',
-      'XLSX Shift Invoice',
+      'Spreadsheet Invoice',
       summarizeValues(group.dropoffLocations, 3) || 'Review Required',
       `Shipments: ${group.shipmentCount}`,
       group.coding
@@ -2141,58 +3144,100 @@ function buildSpreadsheetLogRows(invoiceSummary, fileName, source) {
   });
 }
 
-function generateSpreadsheetSplitHtmlPdf(invoiceSummary, originalName) {
-  const safeCarrier = escapeHtml(invoiceSummary.carrierType);
-  const safeInvoiceNumber = escapeHtml(invoiceSummary.invoiceNumber);
+/**
+ * The coding summary PDF that gets emailed and filed alongside the original.
+ * Lists every invoice found in the workbook, split by RDC code, and prints any
+ * reconciliation problem at the top where it cannot be missed.
+ */
+function generateSpreadsheetSplitHtmlPdf(invoices, invoiceMeta, carrierType, reconciliation, originalName) {
+  const safeCarrier = escapeHtml(carrierType);
   const safeOriginalName = escapeHtml(originalName);
-  const groupRowsHtml = invoiceSummary.groups.map(function(group) {
-    return `
+  const isMulti = invoices.length > 1;
+  const grandTotal = invoices.reduce(function(sum, invoice) {
+    return sum + Number(invoice.totalAmount || 0);
+  }, 0);
+
+  const rowsHtml = invoices.map(function(invoice) {
+    return invoice.groups.map(function(group) {
+      return `
       <tr>
-        <td style="padding: 10px 8px; border-bottom: 1px solid #ddd;">${escapeHtml(group.rdcCode)}</td>
-        <td style="padding: 10px 8px; border-bottom: 1px solid #ddd; font-weight: bold; color: #0b57d0;">${escapeHtml(group.coding)}</td>
-        <td style="padding: 10px 8px; border-bottom: 1px solid #ddd;">${group.shipmentCount}</td>
-        <td style="padding: 10px 8px; border-bottom: 1px solid #ddd;">$${escapeHtml(formatAmountNumber(group.totalAmount))}</td>
-        <td style="padding: 10px 8px; border-bottom: 1px solid #ddd;">${escapeHtml(summarizeValues(group.poNumbers, 8))}</td>
-        <td style="padding: 10px 8px; border-bottom: 1px solid #ddd;">${escapeHtml(summarizeValues(group.dropoffLocations, 3))}</td>
+        <td style="padding: 9px 8px; border-bottom: 1px solid #ddd;">${escapeHtml(invoice.invoiceNumber)}</td>
+        <td style="padding: 9px 8px; border-bottom: 1px solid #ddd;">${escapeHtml(group.rdcCode)}</td>
+        <td style="padding: 9px 8px; border-bottom: 1px solid #ddd; font-weight: bold; color: #0b57d0;">${escapeHtml(group.coding)}</td>
+        <td style="padding: 9px 8px; border-bottom: 1px solid #ddd;">${group.shipmentCount}</td>
+        <td style="padding: 9px 8px; border-bottom: 1px solid #ddd; text-align: right;">$${escapeHtml(formatAmountNumber(group.totalAmount))}</td>
+        <td style="padding: 9px 8px; border-bottom: 1px solid #ddd;">${escapeHtml(summarizeValues(group.poNumbers, 8))}</td>
+        <td style="padding: 9px 8px; border-bottom: 1px solid #ddd;">${escapeHtml(summarizeValues(group.dropoffLocations, 3))}</td>
       </tr>
     `;
+    }).join('');
   }).join('');
+
+  const warningHtml = (reconciliation && reconciliation.issues.length > 0)
+    ? `
+      <div style="margin-top: 16px; padding: 12px 14px; border-left: 4px solid #b3261e; background: #fce8e6; color: #7a1a12;">
+        <strong>Check before posting</strong>
+        <ul style="margin: 8px 0 0; padding-left: 18px;">
+          ${reconciliation.issues.map(function(issue) { return `<li>${escapeHtml(issue)}</li>`; }).join('')}
+        </ul>
+      </div>
+    `
+    : '';
+
+  const declaredRowHtml = (reconciliation && reconciliation.declaredTotal !== null)
+    ? `
+        <tr>
+          <td style="padding: 10px 8px; background: #f5f7fa;"><strong>Declared on Invoice</strong></td>
+          <td style="padding: 10px 8px;">$${escapeHtml(formatAmountNumber(reconciliation.declaredTotal))}${reconciliation.matches ? ' <span style="color:#137333;">(reconciled)</span>' : ' <span style="color:#b3261e;">(does not match line items)</span>'}</td>
+        </tr>
+    `
+    : '';
 
   const htmlContent = `
     <div style="font-family: Arial, sans-serif; padding: 28px; color: #222;">
       <h1 style="margin: 0 0 12px; color: #0b57d0; border-bottom: 2px solid #0b57d0; padding-bottom: 10px;">Spreadsheet Invoice Coding Summary</h1>
-      <table style="width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px;">
+      ${warningHtml}
+      <table style="width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 14px;">
         <tr>
           <td style="padding: 10px 8px; background: #f5f7fa; width: 28%;"><strong>Carrier</strong></td>
           <td style="padding: 10px 8px;">${safeCarrier}</td>
         </tr>
         <tr>
-          <td style="padding: 10px 8px; background: #f5f7fa;"><strong>Invoice #</strong></td>
-          <td style="padding: 10px 8px;">${safeInvoiceNumber}</td>
+          <td style="padding: 10px 8px; background: #f5f7fa;"><strong>Invoices in File</strong></td>
+          <td style="padding: 10px 8px;">${invoices.length}${isMulti ? ' (multi-invoice workbook)' : ''}</td>
         </tr>
         <tr>
           <td style="padding: 10px 8px; background: #f5f7fa;"><strong>Total Amount</strong></td>
-          <td style="padding: 10px 8px; font-weight: bold;">$${escapeHtml(formatAmountNumber(invoiceSummary.totalAmount))}</td>
+          <td style="padding: 10px 8px; font-weight: bold;">$${escapeHtml(formatAmountNumber(grandTotal))}</td>
         </tr>
+        ${declaredRowHtml}
         <tr>
           <td style="padding: 10px 8px; background: #f5f7fa;"><strong>Source File</strong></td>
           <td style="padding: 10px 8px;">${safeOriginalName}</td>
         </tr>
       </table>
 
-      <h2 style="margin-top: 28px; color: #222;">RDC Split</h2>
+      <h2 style="margin-top: 28px; color: #222;">Coding Split</h2>
       <table style="width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px;">
         <thead>
           <tr style="background: #e8f0fe; text-align: left;">
+            <th style="padding: 10px 8px;">Invoice #</th>
             <th style="padding: 10px 8px;">RDC</th>
             <th style="padding: 10px 8px;">Coding</th>
             <th style="padding: 10px 8px;">Shipments</th>
-            <th style="padding: 10px 8px;">Amount</th>
+            <th style="padding: 10px 8px; text-align: right;">Amount</th>
             <th style="padding: 10px 8px;">POs</th>
             <th style="padding: 10px 8px;">Destinations</th>
           </tr>
         </thead>
-        <tbody>${groupRowsHtml}</tbody>
+        <tbody>${rowsHtml}</tbody>
+        <tfoot>
+          <tr style="background: #f5f7fa; font-weight: bold;">
+            <td style="padding: 10px 8px;" colspan="4">Grand Total</td>
+            <td style="padding: 10px 8px; text-align: right;">$${escapeHtml(formatAmountNumber(grandTotal))}</td>
+            <td style="padding: 10px 8px;" colspan="2"></td>
+          </tr>
+        </tfoot>
       </table>
     </div>
   `;
@@ -2229,7 +3274,9 @@ function findSheetByNamePattern(spreadsheet, pattern) {
 }
 
 function findLabelValue(values, labelPattern) {
-  const maxRows = Math.min(values.length, 50);
+  // Invoice tabs put their totals at the bottom, well past the old 50-row cap.
+  const maxRows = Math.min(values.length, 400);
+
   for (let row = 0; row < maxRows; row++) {
     const currentRow = values[row] || [];
     for (let col = 0; col < currentRow.length; col++) {
@@ -2240,7 +3287,7 @@ function findLabelValue(values, labelPattern) {
 
       for (let offset = 1; offset <= 3; offset++) {
         const sameRowValue = String(currentRow[col + offset] || '').trim();
-        if (sameRowValue) {
+        if (sameRowValue && !isSpreadsheetLabelCell(sameRowValue)) {
           return sameRowValue;
         }
       }
@@ -2248,7 +3295,7 @@ function findLabelValue(values, labelPattern) {
       for (let rowOffset = 1; rowOffset <= 3 && row + rowOffset < values.length; rowOffset++) {
         const nextRow = values[row + rowOffset] || [];
         const belowValue = String(nextRow[col] || nextRow[col + 1] || '').trim();
-        if (belowValue) {
+        if (belowValue && !isSpreadsheetLabelCell(belowValue)) {
           return belowValue;
         }
       }
@@ -2257,30 +3304,15 @@ function findLabelValue(values, labelPattern) {
   return '';
 }
 
-function findShiftHeaderRow(displayValues) {
-  for (let rowIndex = 0; rowIndex < Math.min(displayValues.length, 20); rowIndex++) {
-    const row = (displayValues[rowIndex] || []).map(normalizeHeaderValue);
-    if (row.indexOf('po') >= 0 && row.indexOf('dropofflocation') >= 0 && row.indexOf('deliverydate') >= 0) {
-      return rowIndex;
-    }
-  }
-  return -1;
+/**
+ * A cell that is itself a caption ("Send Invoice To:") is never the value of
+ * the label above or beside it.
+ */
+function isSpreadsheetLabelCell(value) {
+  return /:\s*$/.test(String(value || ''));
 }
 
-function mapShiftColumns(headerRow) {
-  const map = {};
-  (headerRow || []).forEach(function(header, index) {
-    const normalized = normalizeHeaderValue(header);
-    if (normalized === 'deliverydate') map.deliveryDate = index;
-    if (normalized === 's' || normalized === 'shipment' || normalized === 'shipmentnumber') map.shipmentNumber = index;
-    if (normalized === 'po') map.po = index;
-    if (normalized === 'pickuplocation') map.pickupLocation = index;
-    if (normalized === 'dropofflocation') map.dropoffLocation = index;
-    if (normalized === 'transportcost') map.transportCost = index;
-    if (normalized === 'total') map.total = index;
-  });
-  return map;
-}
+
 
 function normalizeHeaderValue(value) {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
@@ -2300,17 +3332,15 @@ function getRawCellByIndex(row, index) {
   return row[index] === undefined || row[index] === null ? '' : row[index];
 }
 
+/**
+ * First usable amount among the supplied candidates (raw cell value first, then
+ * its displayed text). Returns 0 when nothing parses, matching the old
+ * behaviour for callers that just want a number to add up.
+ */
 function parseAmountValue() {
   for (let i = 0; i < arguments.length; i++) {
-    const value = arguments[i];
-    if (value === null || value === undefined || value === '') {
-      continue;
-    }
-    if (typeof value === 'number' && !isNaN(value)) {
-      return value;
-    }
-    const parsed = Number(String(value).replace(/[$,\s]/g, ''));
-    if (!isNaN(parsed)) {
+    const parsed = parseMoneyToken(arguments[i]);
+    if (parsed !== null) {
       return parsed;
     }
   }
@@ -2372,7 +3402,7 @@ function extractInvoiceNumberFromFileName(fileName) {
 }
 
 function stripInvoiceExtension(fileName) {
-  return String(fileName || 'invoice').replace(/\.(pdf|xlsx)$/i, '').trim() || 'invoice';
+  return String(fileName || 'invoice').replace(/\.(pdf|xlsx|xlsm|xls|csv|zip)$/i, '').trim() || 'invoice';
 }
 
 function isPdfInvoiceFile(file) {
@@ -2391,14 +3421,42 @@ function isSupportedInvoiceMimeType(mimeType, fileName) {
   return isPdfInvoiceMimeType(mimeType, fileName) || isSpreadsheetInvoiceMimeType(mimeType, fileName);
 }
 
+/**
+ * Everything the tool will pick up from a source folder or mailbox: invoices
+ * themselves plus archives that contain them.
+ */
+function isIngestibleInvoiceMimeType(mimeType, fileName) {
+  return isSupportedInvoiceMimeType(mimeType, fileName) || isArchiveMimeType(mimeType, fileName);
+}
+
+function isIngestibleInvoiceFile(file) {
+  return isIngestibleInvoiceMimeType(file.getMimeType(), file.getName());
+}
+
+function isIngestibleInvoiceAttachment(attachment) {
+  return isIngestibleInvoiceMimeType(attachment.getContentType(), attachment.getName());
+}
+
 function isPdfInvoiceMimeType(mimeType, fileName) {
   const normalizedMimeType = String(mimeType || '').toLowerCase();
   return normalizedMimeType === 'application/pdf' || /\.pdf$/i.test(String(fileName || ''));
 }
 
+const SPREADSHEET_MIME_TYPES = [
+  XLSX_MIME_TYPE,
+  GOOGLE_SHEETS_MIME_TYPE,
+  'application/vnd.ms-excel',
+  'application/vnd.ms-excel.sheet.macroenabled.12',
+  'text/csv',
+  'application/csv'
+];
+
 function isSpreadsheetInvoiceMimeType(mimeType, fileName) {
   const normalizedMimeType = String(mimeType || '').toLowerCase();
-  return normalizedMimeType === XLSX_MIME_TYPE || normalizedMimeType === GOOGLE_SHEETS_MIME_TYPE || /\.xlsx$/i.test(String(fileName || ''));
+  if (SPREADSHEET_MIME_TYPES.indexOf(normalizedMimeType) >= 0) {
+    return true;
+  }
+  return /\.(xlsx|xlsm|xls|csv)$/i.test(String(fileName || ''));
 }
 
 function generateHtmlPdf(data, coding, originalName) {
@@ -2474,6 +3532,451 @@ function generateHtmlPdf(data, coding, originalName) {
   return blob.getAs(MimeType.PDF).setName('Coded_Summary_' + originalName);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * MONEY PARSING & AMOUNT SELECTION
+ *
+ * Invoice totals used to be picked with "first string that looks like money",
+ * which happily returned a line-item rate, a quantity, a weight or a zip code.
+ * Everything below replaces that with an explicit candidate model: find every
+ * money-shaped token, read the label sitting in front of it, score it, and
+ * keep the best one along with a confidence rating so weak reads can be sent
+ * to manual review instead of being logged as fact.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+// Labels that sit immediately in front of a number, strongest first. The first
+// rule that matches the text preceding a number decides its base score.
+const AMOUNT_LABEL_RULES = [
+  {
+    score: 120,
+    name: 'invoice-total',
+    pattern: /\b(?:total\s+amount\s+due|amount\s+due|amount\s+payable|balance\s+due|total\s+due|total\s+payable|invoice\s+total|total\s+invoice(?:\s+amount)?|grand\s+total|net\s+(?:amount\s+)?due|please\s+pay(?:\s+this\s+amount)?|pay\s+this\s+amount|total\s+charges?)\b/i
+  },
+  {
+    score: 80,
+    name: 'total',
+    pattern: /\b(?:total|net\s+total|invoice\s+amount|amount)\b/i
+  },
+  {
+    score: 45,
+    name: 'line-item',
+    pattern: /\b(?:sub\s*-?\s*total|line\s*haul|linehaul|freight(?:\s+charges?)?|transport(?:ation)?\s+cost|carrier\s+charges?|charges?|fuel(?:\s+surcharge)?|surcharge|accessorial|detention|layover|lumper|stop\s*off|tolls?|rate|cost|price|fee)\b/i
+  }
+];
+
+// A number preceded by one of these is a measurement, an identifier or a term —
+// never the invoice total. Anchored to the end so only the *nearest* label counts.
+const AMOUNT_REJECT_LABEL_PATTERN = /\b(?:weights?|wgt|gross|net\s+weight|lbs?|kgs?|pounds?|kilos?|qty|quantity|pieces?|pcs|pallets?|cases?|units?|cartons?|skids?|miles?|mileage|temp(?:erature)?|degrees?|zip|postal(?:\s+code)?|phone|fax|tel(?:ephone)?|mobile|cell|account(?:\s*(?:no|number|#))?|routing|aba|swift|iban|ein|tax\s*id|vat(?:\s*(?:no|number|#))?|terms|net|page|suite|ste|box|load|bol|pro|po|purchase\s+order|invoice|shipment|pickup|delivery|reference|ref|quote|trailer|truck|container|seal|order|customer|vendor|driver|year|percent|per\s+(?:mile|lb|cwt|hour|unit)|hours?|days?)\s*(?:no\.?|number|#|:)?\s*$/i;
+
+// Units that follow a number and prove it is not currency.
+const AMOUNT_REJECT_SUFFIX_PATTERN = /^\s*(?:%|lbs?\b|kgs?\b|pounds?\b|miles?\b|pcs\b|pieces?\b|units?\b|cases?\b|pallets?\b|cartons?\b|gal(?:lons?)?\b|hrs?\b|hours?\b|days?\b|°|deg\b)/i;
+
+const AMOUNT_CURRENCY_BEFORE_PATTERN = /(?:[$€£]|\b(?:USD|US\$|CAD|EUR|GBP)\s*)\s*$/i;
+const AMOUNT_CURRENCY_AFTER_PATTERN = /^\s*(?:USD|CAD|EUR|GBP|dollars?)\b/i;
+
+/**
+ * Convert a money-looking string into a Number.
+ *
+ * Handles currency prefixes/suffixes, thousands separators, parenthesised and
+ * trailing-minus credits, "CR" markers, and European `1.234,56` formatting.
+ * Returns null when the text cannot be read as an amount, so callers can tell
+ * "no amount" apart from "an amount of zero".
+ */
+function parseMoneyToken(rawValue) {
+  if (rawValue === null || rawValue === undefined) {
+    return null;
+  }
+  if (typeof rawValue === 'number') {
+    return isNaN(rawValue) ? null : rawValue;
+  }
+
+  var text = String(rawValue).trim();
+  if (!text) {
+    return null;
+  }
+
+  var negative = false;
+
+  if (/^\(.*\)$/.test(text)) {
+    negative = true;
+    text = text.slice(1, -1);
+  }
+  if (/\b(?:cr|credit)\s*$/i.test(text)) {
+    negative = true;
+    text = text.replace(/\b(?:cr|credit)\s*$/i, '');
+  }
+  if (/-\s*$/.test(text)) {
+    negative = true;
+    text = text.replace(/-\s*$/, '');
+  }
+
+  text = text
+    .replace(/\b(?:USD|US\$|CAD|EUR|GBP|dollars?)\b/gi, '')
+    .replace(/[$€£]/g, '')
+    .replace(/\s+/g, '');
+
+  if (/^-/.test(text)) {
+    negative = true;
+    text = text.replace(/^-+/, '');
+  }
+
+  if (!/^[0-9.,]+$/.test(text) || !/\d/.test(text)) {
+    return null;
+  }
+
+  if (/^\d{1,3}(?:\.\d{3})+,\d{1,2}$/.test(text)) {
+    // European grouping: 1.234.567,89
+    text = text.replace(/\./g, '').replace(',', '.');
+  } else if (/^\d+,\d{1,2}$/.test(text)) {
+    // Decimal comma: 1234,56
+    text = text.replace(',', '.');
+  } else {
+    text = text.replace(/,/g, '');
+  }
+
+  if (!/^\d*\.?\d*$/.test(text)) {
+    return null;
+  }
+
+  var value = Number(text);
+  if (isNaN(value)) {
+    return null;
+  }
+  return negative ? -value : value;
+}
+
+/**
+ * Scan OCR text for every money-shaped token and describe each one: its value,
+ * the label in front of it, whether it carried a currency marker, and where it
+ * sits in the document. Tokens that are clearly part of an identifier, a date,
+ * a measurement or a percentage are dropped here rather than scored.
+ */
+function findAmountCandidates(text) {
+  var lines = String(text || '').split('\n');
+  var candidates = [];
+  var previousLine = '';
+
+  for (var lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    var line = lines[lineIndex];
+    if (!line || !/\d/.test(line)) {
+      if (line && line.trim()) previousLine = line.trim();
+      continue;
+    }
+
+    var tokenPattern = /\d[\d,]*(?:\.\d{1,2})?/g;
+    var match;
+    while ((match = tokenPattern.exec(line)) !== null) {
+      var token = match[0];
+      var start = match.index;
+      var end = start + token.length;
+      var before = line.slice(0, start);
+      var after = line.slice(end);
+
+      // Part of a longer identifier, date, time or decimal we truncated.
+      if (/[A-Za-z0-9]$/.test(before)) continue;
+      if (/[\/:#]$/.test(before)) continue;
+      if (/\d[.\-]$/.test(before)) continue;
+      if (/^[\/:]/.test(after)) continue;
+      if (/^\d/.test(after)) continue;
+      if (/^-\d/.test(after)) continue;
+      if (/^[A-Za-z]/.test(after) && !AMOUNT_CURRENCY_AFTER_PATTERN.test(after)) continue;
+      if (AMOUNT_REJECT_SUFFIX_PATTERN.test(after)) continue;
+
+      var hasCurrency = AMOUNT_CURRENCY_BEFORE_PATTERN.test(before) ||
+        AMOUNT_CURRENCY_AFTER_PATTERN.test(after);
+      var hasCents = /\.\d{2}$/.test(token);
+      var negative = /\(\s*$/.test(before) && /^\s*\)/.test(after);
+      if (!negative && /^\s*(?:-|\bCR\b)/i.test(after)) negative = true;
+      if (!negative && /(?:^|[^\d])-\s*$/.test(before) && hasCurrency) negative = true;
+
+      var value = parseMoneyToken(token);
+      if (value === null) continue;
+      if (negative) value = -Math.abs(value);
+
+      // Label context: the text in front of the number on this line, or — for
+      // table layouts where the number sits alone in its cell/row — the label
+      // line above it.
+      var labelContext = before;
+      if (labelContext.replace(/[^A-Za-z]/g, '').length < 3) {
+        labelContext = previousLine + ' ' + before;
+      }
+
+      candidates.push({
+        value: value,
+        token: token,
+        hasCurrency: hasCurrency,
+        hasCents: hasCents,
+        negative: negative,
+        lineIndex: lineIndex,
+        labelContext: labelContext.replace(/\s+/g, ' ').trim()
+      });
+    }
+
+    if (line.trim()) previousLine = line.trim();
+  }
+
+  return candidates;
+}
+
+/**
+ * Score a single candidate. Returns null when its nearest label proves it is
+ * not currency (weights, quantities, reference numbers, terms, ...).
+ */
+function scoreAmountCandidate(candidate) {
+  var context = candidate.labelContext || '';
+  var immediate = context.slice(-40);
+
+  if (AMOUNT_REJECT_LABEL_PATTERN.test(immediate)) {
+    return null;
+  }
+
+  var labelScore = 0;
+  var labelName = 'unlabelled';
+  for (var i = 0; i < AMOUNT_LABEL_RULES.length; i++) {
+    if (AMOUNT_LABEL_RULES[i].pattern.test(immediate)) {
+      labelScore = AMOUNT_LABEL_RULES[i].score;
+      labelName = AMOUNT_LABEL_RULES[i].name;
+      break;
+    }
+  }
+
+  var score = labelScore;
+  if (candidate.hasCents) score += 25;
+  if (candidate.hasCurrency) score += 20;
+  if (!candidate.hasCents && !candidate.hasCurrency) score -= 60;
+  if (!candidate.hasCents && !candidate.hasCurrency && /^\d{5,}$/.test(candidate.token.replace(/,/g, ''))) {
+    score -= 60; // bare long integer: almost certainly an identifier
+  }
+  if (candidate.value === 0) score -= 40;
+
+  return { score: score, labelScore: labelScore, labelName: labelName };
+}
+
+/**
+ * Pick the invoice total out of OCR text.
+ *
+ * Returns null when nothing usable was found, otherwise:
+ *   { value, formatted, confidence, label, agreement, alternatives }
+ * `confidence` is 'high' | 'medium' | 'low'; callers use it to decide whether
+ * the amount can be logged straight through or needs a human look.
+ */
+function selectInvoiceAmount(text) {
+  var candidates = findAmountCandidates(text);
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  var scored = [];
+  for (var i = 0; i < candidates.length; i++) {
+    var scoring = scoreAmountCandidate(candidates[i]);
+    if (!scoring) continue;
+    var entry = candidates[i];
+    entry.score = scoring.score;
+    entry.labelScore = scoring.labelScore;
+    entry.labelName = scoring.labelName;
+    scored.push(entry);
+  }
+
+  if (scored.length === 0) {
+    return null;
+  }
+
+  // Agreement: an amount repeated under several labels (Total / Amount Due /
+  // Balance Due) is far more likely to be the real total than a one-off number.
+  var valueCounts = {};
+  scored.forEach(function(entry) {
+    var key = entry.value.toFixed(2);
+    valueCounts[key] = (valueCounts[key] || 0) + 1;
+  });
+
+  // Line-item cross-check: when the itemised charges add up to one of the
+  // candidates, that candidate is the total even if its label was weak.
+  var lineItemSum = 0;
+  var lineItemCount = 0;
+  scored.forEach(function(entry) {
+    if (entry.labelName === 'line-item' && (entry.hasCents || entry.hasCurrency)) {
+      lineItemSum += entry.value;
+      lineItemCount += 1;
+    }
+  });
+
+  scored.forEach(function(entry) {
+    var key = entry.value.toFixed(2);
+    entry.agreement = (valueCounts[key] || 1) - 1;
+    entry.score += Math.min(entry.agreement * 12, 36);
+    if (lineItemCount >= 2 && Math.abs(entry.value - lineItemSum) < 0.005) {
+      entry.score += 30;
+      entry.matchesLineItemSum = true;
+    }
+  });
+
+  scored.sort(function(a, b) {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.lineIndex !== a.lineIndex) return b.lineIndex - a.lineIndex;
+    return Math.abs(b.value) - Math.abs(a.value);
+  });
+
+  var best = scored[0];
+
+  var confidence = 'low';
+  if (best.labelScore >= 120 && (best.hasCents || best.hasCurrency)) {
+    confidence = 'high';
+  } else if (best.labelScore >= 80 && (best.agreement >= 1 || best.matchesLineItemSum)) {
+    confidence = 'high';
+  } else if (best.labelScore >= 80 || best.matchesLineItemSum) {
+    confidence = 'medium';
+  } else if (best.labelScore >= 45 && (best.hasCents || best.hasCurrency)) {
+    confidence = 'medium';
+  }
+
+  // Two different values fighting for the same top label tier means we cannot
+  // tell which one is the total — say so rather than guessing.
+  var rivals = scored.filter(function(entry) {
+    return entry.labelScore === best.labelScore && Math.abs(entry.value - best.value) >= 0.005;
+  });
+  if (rivals.length > 0 && confidence === 'high') {
+    confidence = 'medium';
+  }
+
+  var alternatives = [];
+  var seen = {};
+  seen[best.value.toFixed(2)] = true;
+  for (var j = 1; j < scored.length && alternatives.length < 4; j++) {
+    var key2 = scored[j].value.toFixed(2);
+    if (seen[key2]) continue;
+    seen[key2] = true;
+    alternatives.push({
+      value: scored[j].value,
+      formatted: formatAmountNumber(scored[j].value),
+      label: scored[j].labelContext.slice(-40)
+    });
+  }
+
+  return {
+    value: best.value,
+    formatted: formatAmountNumber(best.value),
+    confidence: confidence,
+    label: best.labelContext.slice(-40),
+    labelName: best.labelName,
+    agreement: best.agreement,
+    matchesLineItemSum: !!best.matchesLineItemSum,
+    alternatives: alternatives
+  };
+}
+
+/**
+ * Normalize any amount-ish value (string from a mapping profile, spreadsheet
+ * cell, user edit) to the "1234.56" string the log sheet and PDFs expect.
+ * Returns '' when the value is not an amount.
+ */
+function normalizeAmountText(value) {
+  var parsed = parseMoneyToken(value);
+  if (parsed === null) {
+    var fallback = selectInvoiceAmount(String(value || ''));
+    if (!fallback) return '';
+    parsed = fallback.value;
+  }
+  return formatAmountNumber(parsed);
+}
+
+/**
+ * The value written into the sheet's Amount column. Real numbers are written as
+ * numbers so downstream SUM/pivot formulas work; anything unparseable falls
+ * back to the placeholder text.
+ */
+function sheetAmountValue(invoiceData) {
+  if (!invoiceData) return MISSING_VALUE_LABEL;
+
+  // Read the displayed amount first: a mapping profile, a learned correction or
+  // a reviewer's edit all write to `amount`, and parsing it here means the
+  // numeric twin can never drift out of step with what the review UI showed.
+  var parsed = parseMoneyToken(invoiceData.amount);
+  if (parsed !== null) {
+    return parsed;
+  }
+  if (typeof invoiceData.amountValue === 'number' && !isNaN(invoiceData.amountValue)) {
+    return invoiceData.amountValue;
+  }
+  return invoiceData.amount || MISSING_VALUE_LABEL;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * LAYOUT-AWARE FIELD HELPERS
+ *
+ * PDF-to-text flattening destroys column structure: a header row and its value
+ * row become two adjacent lines, and side-by-side address blocks merge into a
+ * single line per row. The helpers below read those shapes directly instead of
+ * relying on "label immediately followed by value", which never matches.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+const DATE_TOKEN_PATTERN_G = /(?:[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{2,4}|\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})/g;
+const CITY_STATE_ZIP_PATTERN_G = /([A-Z][A-Za-z.'\-]*(?:[ ][A-Z][A-Za-z.'\-]*){0,3},\s*(?:[A-Z]{2}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+\d{5}(?:-\d{4})?)/g;
+
+/**
+ * Find a header line matching every supplied pattern, plus the first non-empty
+ * line beneath it (its value row).
+ * Returns null when no such pair exists.
+ */
+function findHeaderValueRow(text, requiredHeaderPatterns) {
+  const lines = String(text || '').split('\n');
+  const patterns = requiredHeaderPatterns || [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+
+    let matchesAll = patterns.length > 0;
+    for (let r = 0; r < patterns.length; r++) {
+      if (!patterns[r].test(line)) { matchesAll = false; break; }
+    }
+    if (!matchesAll) continue;
+
+    for (let j = i + 1; j < Math.min(lines.length, i + 4); j++) {
+      if (lines[j] && lines[j].trim()) {
+        return {
+          header: line.trim(),
+          values: lines[j].trim(),
+          headerIndex: i,
+          valueIndex: j
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Pull the origin and destination out of a side-by-side address block.
+ * The block header ("Origin Address ... Destination Address", "Shipper ...
+ * Consignee") is located first so remit-to and bill-to addresses elsewhere on
+ * the page cannot be mistaken for shipment endpoints.
+ */
+function extractAddressPair(text) {
+  const empty = { origin: null, destination: null };
+  const lines = String(text || '').split('\n');
+
+  const originPattern = /\b(?:Origin|Shipper|Pick\s*Up|Pickup|Ship\s*From)\b/i;
+  const destinationPattern = /\b(?:Destination|Consignee|Delivery|Drop\s*Off|Ship\s*To)\b/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !originPattern.test(line) || !destinationPattern.test(line)) continue;
+    // "Ship Date  Delivery Date  ..." is a shipment header, not an address block.
+    if (/\bdate\b/i.test(line) && !/\b(?:address|location)\b/i.test(line)) continue;
+
+    const block = lines.slice(i + 1, i + 8).join('\n');
+    const locations = block.match(CITY_STATE_ZIP_PATTERN_G) || [];
+    if (locations.length === 0) continue;
+
+    return {
+      origin: locations[0] ? locations[0].replace(/\s+/g, ' ').trim() : null,
+      destination: locations[1] ? locations[1].replace(/\s+/g, ' ').trim() : null
+    };
+  }
+
+  return empty;
+}
+
+
 function extractInvoiceData(text, fileName) {
   const cleanText = text
     .replace(/","/g, '\n')
@@ -2492,31 +3995,54 @@ function extractInvoiceData(text, fileName) {
   // Generic words that should never be accepted as field values
   const GENERIC_WORDS = /^(drop|pickup|destination|origin|weight|commodity|equipment|total|amount|number|description|date|invoice|payment|from|ship|billing|company|headquarters|location|address|contact|remit|notes|page|services|logistics|freight|transport|carriers?|inc|llc|corp|ltd)$/i;
 
-  const extractFirst = regexes => {
+  // Walk EVERY match of each pattern, not just the first. The old version gave
+  // up on a pattern as soon as its first hit failed validation, so an invoice
+  // with "PO Box 207779" in the remit block never reached the real "PO # ..."
+  // further down the page.
+  const extractFrom = (regexes, requireDigit) => {
     for (let i = 0; i < regexes.length; i++) {
-      const match = cleanText.match(regexes[i]);
-      if (!match || !match[1] || match[1].trim().length <= 1) continue;
-      const value = match[1].trim();
-      // Reject pure generic words or values with no digits where a number is expected
-      if (GENERIC_WORDS.test(value)) continue;
-      return value;
+      const source = regexes[i];
+      const flags = source.flags.indexOf('g') >= 0 ? source.flags : source.flags + 'g';
+      const scanner = new RegExp(source.source, flags);
+      let match;
+      while ((match = scanner.exec(cleanText)) !== null) {
+        if (match[0].length === 0) { scanner.lastIndex += 1; continue; }
+        if (!match[1]) continue;
+        const value = match[1].trim();
+        if (value.length <= 1) continue;
+        if (GENERIC_WORDS.test(value)) continue;
+        if (requireDigit && !/\d/.test(value)) continue;
+        return value;
+      }
     }
     return null;
   };
 
+  const extractFirst = regexes => extractFrom(regexes, false);
+
   // Extract a value that MUST contain at least one digit (for IDs, numbers, dates, amounts)
-  const extractNumeric = regexes => {
-    for (let i = 0; i < regexes.length; i++) {
-      const match = cleanText.match(regexes[i]);
-      if (!match || !match[1] || match[1].trim().length <= 1) continue;
-      const value = match[1].trim();
-      if (GENERIC_WORDS.test(value)) continue;
-      // Must contain at least one digit
-      if (!/\d/.test(value)) continue;
-      return value;
+  const extractNumeric = regexes => extractFrom(regexes, true);
+
+  // Freight invoices very often print shipment fields as a header row followed
+  // by a value row. Read those positionally — label-proximity regexes cannot
+  // see across a column layout.
+  const shipmentRow = findHeaderValueRow(cleanText, [
+    /\bShip(?:ping)?\s*Date\b/i,
+    /\b(?:Delivery|Drop\s*Off|Deliver)\s*Date\b/i
+  ]);
+  let rowShipDate = null;
+  let rowDeliveryDate = null;
+  let rowPo = null;
+  if (shipmentRow) {
+    const rowDates = shipmentRow.values.match(DATE_TOKEN_PATTERN_G) || [];
+    if (rowDates.length >= 1) rowShipDate = rowDates[0];
+    if (rowDates.length >= 2) rowDeliveryDate = rowDates[1];
+    // When "PO #" is the final header column, the trailing value is the PO.
+    if (/\bP\.?O\.?\s*#?\s*$/i.test(shipmentRow.header)) {
+      const tailMatch = shipmentRow.values.match(/([A-Z]{0,3}\d{5,})\s*$/i);
+      if (tailMatch) rowPo = tailMatch[1];
     }
-    return null;
-  };
+  }
 
   // ── Invoice Number ──────────────────────────────────────────────────────────
   // Strategy 1: Explicit label with number/# keyword followed by alphanumeric ID
@@ -2548,17 +4074,20 @@ function extractInvoiceData(text, fileName) {
   }
 
   // ── PO Number ───────────────────────────────────────────────────────────────
-  const po = extractNumeric([
-    /\b(?:PO|P\.O\.|Purchase\s*Order)\s*(?:No\.?|Number|#)?\s*:?\s*([A-Z0-9][-A-Z0-9]{2,})/i,
-    /\b(?:Reference|Ref)\s*(?:No\.?|#|Number)?\s*:?\s*([A-Z0-9]{3,}[-A-Z0-9]*)/i
+  // Horizontal whitespace only: a PO label at the end of a header row must not
+  // swallow the first token of the row beneath it.
+  const po = rowPo || extractNumeric([
+    /\b(?:PO|P\.O\.|Purchase\s*Order)\s*(?:No\.?|Number|#)?[ \t]*:?[ \t]*([A-Z0-9][-A-Z0-9]{2,})/i,
+    /\b(?:Customer|Client)\s*(?:PO|Order)\s*(?:No\.?|Number|#)?[ \t]*:?[ \t]*([A-Z0-9][-A-Z0-9]{2,})/i,
+    /\b(?:Reference|Ref)\s*(?:No\.?|#|Number)?[ \t]*:?[ \t]*([A-Z0-9]{3,}[-A-Z0-9]*)/i
   ]);
 
   // ── Amount ──────────────────────────────────────────────────────────────────
-  const amount = extractNumeric([
-    /\b(?:Total\s*(?:Due)?|Amount\s*(?:Due)?|Balance\s*(?:Due)?|LINE\s*HAUL)\b[\s\S]{0,60}?\$?\s*([0-9,]{1,10}\.[0-9]{2})/i,
-    /\bTotal\b[^\n]{0,30}\n[^\n]{0,10}\$?\s*([0-9,]{1,10}\.[0-9]{2})/i,
-    /\$\s*([0-9,]{1,10}\.[0-9]{2})/
-  ]);
+  // Scored candidate selection (see selectInvoiceAmount) rather than "first
+  // thing on the page that looks like money" — that old approach happily
+  // returned line-item rates, weights and quantities as the invoice total.
+  const amountResult = selectInvoiceAmount(cleanText);
+  const amount = amountResult ? amountResult.formatted : null;
 
   // ── Remit Info ───────────────────────────────────────────────────────────────
   const remitMatch = cleanText.match(/\b(?:ACH\s*Remittance|Payment\s*Remittance(?:\s*Instructions)?|Remit\s*To|Bank\s*Transfers?)\b[\s:]*\n+([\s\S]{15,300}?)(?=\n(?:Total|Amount|Special\s*Instructions|Page\s*\d|Notes|$))/i);
@@ -2568,13 +4097,17 @@ function extractInvoiceData(text, fileName) {
   const DATE_PAT = /([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/;
   const DATE_PAT_G = new RegExp(DATE_PAT.source, 'g');
 
-  let shipDate = extractNumeric([
-    /\b(?:Ship|Pickup|Pickup\s*Date|Ship\s*Date)\b[\s:]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
+  let shipDate = rowShipDate || extractNumeric([
+    /\b(?:Ship|Pickup|Pick\s*Up|Ship\s*Date|Pickup\s*Date)\b[\s:]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
     /\b(?:Bill(?:ing)?\s*Date|Invoice\s*Date)\b[\s:]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i
   ]);
 
-  let deliveryDate = extractNumeric([
-    /\b(?:Delivery|Drop\s*Off|Delivered|Due)\s*Date\b[\s:]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i
+  // NOTE: "Due Date" is the *payment* due date driven by the payment terms, not
+  // the delivery date. Reading it as a delivery date logged the wrong date on
+  // every invoice that printed payment terms, so it is deliberately absent here.
+  let deliveryDate = rowDeliveryDate || extractNumeric([
+    /\b(?:Delivery|Drop\s*Off|Delivered|Deliver)\s*Date\b[\s:]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
+    /\b(?:Date\s*Delivered|Actual\s*Delivery)\b[\s:]*([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i
   ]);
 
   // Fallback: grab dates from a "Pickup Date ... Drop Off Date" context block
@@ -2588,19 +4121,25 @@ function extractInvoiceData(text, fileName) {
   }
 
   // ── Origin / Destination ─────────────────────────────────────────────────────
-  const origin = extractFirst([
+  // Side-by-side "Origin Address    Destination Address" blocks merge into one
+  // line per row once the PDF is flattened to text, so pull the City/State/ZIP
+  // pairs out of the block instead of trying to read a single labelled value.
+  const addressPair = extractAddressPair(cleanText);
+
+  const origin = addressPair.origin || extractFirst([
     /\b(?:Shipper|Origin|Stop\s*1)\b[\s:]*\n\s*([^,\n]{5,})/i,
-    /\b(?:Pickup\s*Location|Origin\s*City)\b[\s:]*\n?\s*([^\n,]{5,80})/i
+    /\b(?:Pickup\s*Location|Origin\s*City|Ship\s*From)\b[\s:]*\n?\s*([^\n,]{5,80})/i
   ]);
 
-  const destination = extractFirst([
+  const destination = addressPair.destination || extractFirst([
     /\b(?:Consignee|Destination|Stop\s*2)\b[\s:]*\n\s*([^,\n]{5,})/i,
-    /\b(?:Delivery\s*Location|Destination\s*City)\b[\s:]*\n?\s*([^\n,]{5,80})/i
+    /\b(?:Delivery\s*Location|Destination\s*City|Ship\s*To)\b[\s:]*\n?\s*([^\n,]{5,80})/i
   ]);
 
   // ── Product Type ─────────────────────────────────────────────────────────────
   const productType = extractFirst([
     /\bCommodity\b\s*\n\s*Equipment\s*Type\s*\n\s*([^\n]+)/i,
+    /\bEquipment\s*Type\b[\s:]*([A-Za-z][A-Za-z0-9\/ -]{1,28}?)(?=\s*(?:Weight|Temp|Commodity|Qty|$))/i,
     /\b(?:Commodity\s*Description|Product\s*Description|Item\s*Description)\b[\s:]*\n?\s*([^\n]{3,80})/i,
     /\b(?:Product|Commodity)\b[\s:]*([^\n]{3,60})/i
   ]);
@@ -2611,12 +4150,35 @@ function extractInvoiceData(text, fileName) {
     shipDate: clean(shipDate, MISSING_VALUE_LABEL),
     deliveryDate: clean(deliveryDate, MISSING_VALUE_LABEL),
     amount: clean(amount, MISSING_VALUE_LABEL),
+    amountValue: amountResult ? amountResult.value : null,
+    amountConfidence: amountResult ? amountResult.confidence : 'none',
+    amountLabel: amountResult ? amountResult.label : '',
+    amountAlternatives: amountResult ? amountResult.alternatives : [],
     origin: clean(origin, 'Review Required'),
     destination: clean(destination, 'Review Required'),
     productType: clean(productType, 'Review Required'),
     remitInfo: clean(remitInfo, MISSING_VALUE_LABEL, true)
   };
 }
+
+/**
+ * Should this invoice go to a human before its amount is trusted?
+ *
+ * Controlled by HOLD_LOW_CONFIDENCE_AMOUNTS. Only weak reads are held — a total
+ * that carried an explicit "Amount Due"/"Total" label, or that reconciles
+ * against the line items, goes straight through.
+ */
+function shouldHoldForAmountReview(invoiceData) {
+  if (!HOLD_LOW_CONFIDENCE_AMOUNTS) return false;
+  if (!invoiceData) return false;
+
+  const confidence = invoiceData.amountConfidence;
+  if (confidence === 'high' || confidence === 'confirmed') return false;
+
+  // No amount at all, or an amount we could not justify from its label.
+  return true;
+}
+
 
 function determineCoding(text) {
   let rdc = 'RDC-UNKNOWN';
@@ -2644,6 +4206,19 @@ function determineCoding(text) {
 function determineCarrierType(text, invoiceData, appliedCoding, fileName) {
   const searchSpace = text.replace(/\s+/g, ' ').toLowerCase();
 
+  // 1. An explicit carrier/vendor label always wins.
+  const labelledCarrier = matchCarrierRegexes(text, [
+    /\b(?:Carrier|Motor\s*Carrier|Hauler|Vendor|Supplier)\s*(?:Name)?\s*:\s*([^\n,]{3,80})/i,
+    /\b(?:Carrier|Motor\s*Carrier|Hauler|Vendor)\s*(?:Name)?\s*:?\s*\n\s*([^\n,]{3,80})/i
+  ]);
+  if (labelledCarrier) return labelledCarrier;
+
+  // 2. The letterhead of the invoice: the party billing us IS the carrier.
+  const vendorName = extractVendorNameFromLetterhead(text);
+  if (vendorName) return vendorName;
+
+  // 3. Commodity keywords. These describe what moved rather than who moved it,
+  //    so they are a late fallback, not the first thing tried.
   for (let i = 0; i < ROUTING_RULES.catRules.length; i += 1) {
     const rule = ROUTING_RULES.catRules[i];
     if (searchSpace.includes(rule.keyword)) {
@@ -2651,22 +4226,16 @@ function determineCarrierType(text, invoiceData, appliedCoding, fileName) {
     }
   }
 
-  const carrierRegexes = [
-    /\b(?:Carrier|Trucking(?:\s+Company)?|Hauler|Motor Carrier|Vendor)\b[\s\n]*:?\s*([^\n,]{3,80})/i,
-    /\bBill\s*To\b[\s\n]*:?\s*([^\n,]{3,80})/i
-  ];
+  const billToCarrier = matchCarrierRegexes(text, [
+    /\b(?:Trucking(?:\s+Company)?|Logistics\s+Provider)\b[\s\n]*:?\s*([^\n,]{3,80})/i,
+    /\bRemit\s*To\b[\s\n]*:?\s*\n\s*([^\n,]{3,80})/i
+  ]);
+  if (billToCarrier) return billToCarrier;
 
-  for (let i = 0; i < carrierRegexes.length; i += 1) {
-    const match = text.match(carrierRegexes[i]);
-    if (match && match[1]) {
-      const candidate = match[1].replace(/\s+/g, ' ').trim();
-      if (isLikelyCarrierType(candidate)) {
-        return candidate;
-      }
-    }
-  }
-
-  if (invoiceData && invoiceData.productType && invoiceData.productType !== 'Review Required') {
+  // 4. Product type, but never an equipment type — "Van" is not a carrier.
+  if (invoiceData && invoiceData.productType &&
+      invoiceData.productType !== 'Review Required' &&
+      !isEquipmentTypeValue(invoiceData.productType)) {
     return invoiceData.productType;
   }
 
@@ -2678,6 +4247,78 @@ function determineCarrierType(text, invoiceData, appliedCoding, fileName) {
   }
 
   return stripInvoiceExtension(fileName).slice(0, 48) || 'Unknown Carrier';
+}
+
+/**
+ * Return the first regex capture that survives isLikelyCarrierType.
+ */
+function matchCarrierRegexes(text, regexes) {
+  for (let i = 0; i < regexes.length; i += 1) {
+    const match = text.match(regexes[i]);
+    if (match && match[1]) {
+      const candidate = match[1].replace(/\s+/g, ' ').trim();
+      if (isLikelyCarrierType(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Read the carrier's trading name off the invoice letterhead.
+ *
+ * Handles the common "<Legal Entity> d/b/a" / "<Trading Name>" pair — without
+ * it, an invoice headed "DM Trans, LLC d/b/a" / "Arrive Logistics" filed itself
+ * under the shipper or the equipment type instead of under Arrive.
+ */
+function extractVendorNameFromLetterhead(text) {
+  const lines = String(text || '').split('\n').map(function(line) { return line.trim(); });
+
+  // "d/b/a" on its own or at the end of a line: the trading name is next.
+  for (let i = 0; i < Math.min(lines.length, 12); i++) {
+    if (!/\bd\/?\s*b\/?\s*a\.?\s*$/i.test(lines[i])) continue;
+    for (let j = i + 1; j < Math.min(lines.length, i + 3); j++) {
+      const candidate = lines[j].replace(/\s+/g, ' ').trim();
+      if (candidate && !isAddressLine(candidate) && isLikelyCarrierType(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  // Otherwise the first company-shaped line in the letterhead block.
+  for (let i = 0; i < Math.min(lines.length, 8); i++) {
+    const candidate = lines[i].replace(/\s+/g, ' ').trim();
+    if (!candidate || isAddressLine(candidate)) continue;
+    if (/\b(?:invoice|statement|bill|remittance|headquarters|page)\b/i.test(candidate)) continue;
+    if (!/\b(?:inc|llc|l\.l\.c|ltd|corp(?:oration)?|co|company|logistics|transport(?:ation)?|trucking|freight|carriers?|express|lines|group|services)\b\.?/i.test(candidate)) continue;
+    if (isLikelyCarrierType(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Street addresses, city/state/ZIP lines and phone numbers are not names.
+ */
+function isAddressLine(value) {
+  const text = String(value || '').trim();
+  if (!text) return true;
+  if (/^\d/.test(text)) return true;
+  if (/\b\d{5}(?:-\d{4})?\b/.test(text)) return true;
+  if (/\b(?:P\.?O\.?\s*Box|Suite|Ste\.?|Floor|Fl\.?|Building|Bldg\.?|Drive|Street|Avenue|Road|Blvd|Boulevard|Lane|Parkway|Hwy|Highway)\b/i.test(text)) return true;
+  if (/^\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}$/.test(text)) return true;
+  return false;
+}
+
+/**
+ * Trailer/equipment descriptors that must never be treated as a carrier name.
+ */
+function isEquipmentTypeValue(value) {
+  return /^(?:dry\s*)?(?:van|reefer|refrigerated|flat\s*bed|flatbed|step\s*deck|stepdeck|container|intermodal|box\s*truck|straight\s*truck|tanker|hopper|conestoga|power\s*only|ltl|ftl|dry)\b/i
+    .test(String(value || '').trim());
 }
 
 function isLikelyCarrierType(value) {
@@ -2726,10 +4367,13 @@ function buildOutputFileNames(carrierType, originalName, mergePairId) {
 
 function buildOutputBlobs(carrierType, originalName, codeSheetBlob, originalPdfBlob, mergePairId) {
   const names = buildOutputFileNames(carrierType, originalName, mergePairId);
-  return [
-    codeSheetBlob.copyBlob().setName(names.codeSheetName),
-    originalPdfBlob.copyBlob().setName(names.originalPdfName)
-  ];
+  const blobs = [codeSheetBlob.copyBlob().setName(names.codeSheetName)];
+  // The original is absent when a review item came from a Gmail attachment
+  // rather than a Drive file; emit the code sheet on its own instead of failing.
+  if (originalPdfBlob) {
+    blobs.push(originalPdfBlob.copyBlob().setName(names.originalPdfName));
+  }
+  return blobs;
 }
 
 function schedulePostProcessingMerge() {
@@ -3015,12 +4659,13 @@ function listSourcePdfFiles(limit) {
     const iter = folder.getFiles();
     while (iter.hasNext() && files.length < maxItems) {
       const file = iter.next();
-      if (!isSupportedInvoiceFile(file)) {
+      if (!isIngestibleInvoiceFile(file)) {
         continue;
       }
       files.push({
         id: file.getId(),
         name: file.getName(),
+        isArchive: isArchiveFile(file),
         size: file.getSize(),
         updatedAt: file.getLastUpdated().toISOString(),
         folderId: folder.getId(),

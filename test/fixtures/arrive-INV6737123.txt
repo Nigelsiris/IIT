@@ -1,0 +1,33 @@
+Headquarters Address Invoice
+DM Trans, LLC d/b/a
+Arrive Logistics
+7701 Metropolis Drive Load # 8497038
+Building 15 Invoice # INV6737123
+Austin, TX 78744 Date 3/20/2026
+Terms Net 30
+Due Date 4/19/2026
+Currency US Dollar
+Bill To Remit To
+LIDL USA INC. Arrive Logistics
+500 S Clark St. PO Box 207779
+Arlington, Virginia 22202 Dallas, TX 75320-07779
+888-861-0650
+Ship Date Delivery Date Pick Up # BOL # Delivery # Shipment ID PO #
+3/18/2026 3/19/2026 FRG 190326950 S113703526 118819032601
+Item Quantity Amount
+Line Haul 1 $1,150.00
+Equipment Type: Van Weight: 43,500
+Origin Address Destination Address
+Polar LIDL U.S. LLC
+111 HIGGINS STREET 6120 SMITH STATION RD
+Worcester, Massachusetts 01610 Fredericksburg, Virginia 22407-9321
+US US
+Reference Numbers Total $1,150.00
+Rate Quote Reference Id Q113719329, PO # 118819032601, PO
+# 118819032601
+Weight: 43,500
+Amount Due $1,150.00
+3% service charge added for credit card payments. Invoices not fully paid within the payment terms indicated above will be assessed a monthly
+penalty of 1% of the balance each month until paid in full.
+Thank You
+PAY INVOICE
