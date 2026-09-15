@@ -128,6 +128,7 @@ const LOG_HEADERS = [
 let invoiceSheetCache = null;
 let emailFiltersCache = null;
 let sendAsAliasCache = null;
+let scriptOwnerCache = null;
 const MAIL_CONFIG_REPAIR_FLAG = 'MAIL_CONFIG_REPAIRED_AT';
 
 function onOpen() {
@@ -1451,8 +1452,17 @@ const EMAIL_FILTER_BODY_LIMIT = 20000;
  * they encode the inbound/outbound split this tool was built for, and they are
  * meant to be edited in the Email Filters tab, not treated as fixed.
  */
+const DEFAULT_CATCH_LABEL = 'Backup Catch';
+
 const DEFAULT_EMAIL_FILTERS = {
   enabled: true,
+  // An escape hatch for everything the rules cannot anticipate: drop the label
+  // on a message by hand and it gets processed, no questions asked. Manual
+  // forwards are the main reason it exists — they arrive from whoever pressed
+  // Forward, under a "Fwd:" subject, often outside any search the rules use.
+  catchLabel: DEFAULT_CATCH_LABEL,
+  catchLabelBypassesRules: true,
+  catchLabelRemoveAfterProcessing: true,
   fetch: {
     mode: 'builder',
     rawQuery: '',
@@ -1613,6 +1623,11 @@ function normalizeEmailFilters(raw) {
 
   return {
     enabled: source.enabled !== false,
+    catchLabel: source.catchLabel === undefined
+      ? defaults.catchLabel
+      : String(source.catchLabel || '').trim(),
+    catchLabelBypassesRules: source.catchLabelBypassesRules !== false,
+    catchLabelRemoveAfterProcessing: source.catchLabelRemoveAfterProcessing !== false,
     fetch: fetchSettings,
     delegatedMailboxes: normalizeStringList(source.delegatedMailboxes).map(function(entry) {
       return entry.toLowerCase();
@@ -1789,9 +1804,427 @@ function parseGmailQueryToFetchSettings(query) {
   return settings;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * FORWARD-AS-ATTACHMENT (.eml)
+ *
+ * "Forward as attachment" in Gmail, and dragging a message into a new one in
+ * Outlook, wrap the original in a message/rfc822 part rather than quoting it.
+ * The invoice is then an attachment *inside* an attachment, and every
+ * attachment check on the outer message comes up empty — so the mail looked to
+ * this tool like a note with nothing in it.
+ *
+ * There is no MIME parser in Apps Script, so this walks the raw message text:
+ * find the multipart boundary, split into parts, and decode any part that is a
+ * supported invoice. Good enough for mail produced by real clients, and it
+ * never throws — a message it cannot read simply yields no attachments.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+const EML_MIME_TYPES = ['message/rfc822', 'application/octet-stream'];
+const MAX_EML_DEPTH = 3;
+const MAX_EML_BYTES = 25 * 1024 * 1024;
+
+function isEmlAttachment(attachment) {
+  const name = String(attachment.getName ? attachment.getName() : '');
+  const type = String(attachment.getContentType ? attachment.getContentType() : '').toLowerCase();
+  if (/\.eml$/i.test(name) || /\.msg$/i.test(name)) return true;
+  return type === 'message/rfc822';
+}
+
+/**
+ * Every invoice attachment on a message, including any buried inside a
+ * forwarded-as-attachment .eml.
+ *
+ * Returns objects shaped like GmailAttachment (getName / getContentType /
+ * getSize / copyBlob) so callers do not care where a file came from.
+ */
+function gatherInvoiceAttachments(message) {
+  let attachments = [];
+  try {
+    attachments = message.getAttachments() || [];
+  } catch (error) {
+    return [];
+  }
+
+  const collected = [];
+
+  for (let i = 0; i < attachments.length; i++) {
+    const attachment = attachments[i];
+
+    if (isIngestibleInvoiceAttachment(attachment)) {
+      collected.push(attachment);
+      continue;
+    }
+
+    if (!isEmlAttachment(attachment)) {
+      continue;
+    }
+
+    const nested = extractAttachmentsFromEml(attachment, 0);
+    if (nested.length > 0) {
+      appendProcessingFeed('info', `Opened ${attachment.getName()} and found ${nested.length} invoice file(s) inside.`, {
+        container: attachment.getName(),
+        files: nested.map(function(item) { return item.getName(); })
+      });
+    }
+    nested.forEach(function(item) { collected.push(item); });
+  }
+
+  return collected;
+}
+
+/**
+ * Pull the invoice attachments out of one .eml blob.
+ */
+function extractAttachmentsFromEml(attachment, depth) {
+  if (Number(depth || 0) >= MAX_EML_DEPTH) return [];
+
+  let raw = '';
+  try {
+    const blob = attachment.copyBlob ? attachment.copyBlob() : attachment;
+    const bytes = blob.getBytes();
+    if (bytes.length > MAX_EML_BYTES) {
+      appendProcessingFeed('warning', `${attachment.getName()} is too large to open (${bytes.length} bytes).`, {});
+      return [];
+    }
+    raw = Utilities.newBlob(bytes).getDataAsString('UTF-8');
+  } catch (error) {
+    appendProcessingFeed('warning', `Could not read ${attachment.getName()}: ${error.message}`, {});
+    return [];
+  }
+
+  return parseEmlAttachments(raw, depth);
+}
+
+/**
+ * Walk a raw RFC-822 message and return its invoice attachments.
+ * Pure string work, so this is exercised directly by the tests.
+ */
+function parseEmlAttachments(rawMessage, depth) {
+  const results = [];
+  const raw = String(rawMessage || '');
+  if (!raw) return results;
+
+  const boundary = findMimeBoundary(raw);
+  if (!boundary) {
+    return results;
+  }
+
+  const parts = splitMimeParts(raw, boundary);
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const headers = parseMimeHeaders(part.headerText);
+    const contentType = String(headers['content-type'] || '');
+    const mediaType = contentType.split(';')[0].trim().toLowerCase();
+    const fileName = mimeFileName(headers);
+
+    // Nested multipart: recurse rather than trying to decode it as a file.
+    if (mediaType.indexOf('multipart/') === 0) {
+      parseEmlAttachments(part.headerText + '\r\n\r\n' + part.body, Number(depth || 0)).forEach(function(item) {
+        results.push(item);
+      });
+      continue;
+    }
+
+    // A message forwarded inside a forward.
+    if (mediaType === 'message/rfc822') {
+      parseEmlAttachments(part.body, Number(depth || 0) + 1).forEach(function(item) {
+        results.push(item);
+      });
+      continue;
+    }
+
+    if (!fileName) continue;
+
+    const resolvedType = mediaType && mediaType !== 'application/octet-stream'
+      ? mediaType
+      : mimeTypeForFileName(fileName);
+
+    if (!isSupportedInvoiceMimeType(resolvedType, fileName) && !isArchiveMimeType(resolvedType, fileName)) {
+      continue;
+    }
+
+    const encoding = String(headers['content-transfer-encoding'] || '').trim().toLowerCase();
+    const blob = decodeMimePartToBlob(part.body, encoding, resolvedType, fileName);
+    if (blob) {
+      results.push(wrapBlobAsAttachment(blob, resolvedType, fileName));
+    }
+  }
+
+  return results;
+}
+
+/**
+ * The boundary token from the outermost Content-Type header.
+ */
+function findMimeBoundary(raw) {
+  const headerEnd = findHeaderBlockEnd(raw);
+  const headerText = raw.slice(0, headerEnd);
+  const match = headerText.match(/boundary\s*=\s*"([^"]+)"/i) ||
+    headerText.match(/boundary\s*=\s*([^\s;"]+)/i);
+  return match ? match[1] : '';
+}
+
+function findHeaderBlockEnd(raw) {
+  const crlf = raw.indexOf('\r\n\r\n');
+  const lf = raw.indexOf('\n\n');
+  if (crlf >= 0 && (lf < 0 || crlf < lf)) return crlf;
+  if (lf >= 0) return lf;
+  return raw.length;
+}
+
+/**
+ * Split a multipart body on its boundary, returning { headerText, body } for
+ * each part.
+ */
+function splitMimeParts(raw, boundary) {
+  const marker = '--' + boundary;
+  const segments = raw.split(marker);
+  const parts = [];
+
+  // segments[0] is the preamble; the last is the epilogue after the closing
+  // "--boundary--".
+  for (let i = 1; i < segments.length; i++) {
+    let segment = segments[i];
+    if (segment.indexOf('--') === 0) break; // closing boundary
+    segment = segment.replace(/^\r?\n/, '');
+
+    const headerEnd = findHeaderBlockEnd(segment);
+    const headerText = segment.slice(0, headerEnd);
+    let body = segment.slice(headerEnd).replace(/^(\r\n\r\n|\n\n)/, '');
+    body = body.replace(/\r?\n$/, '');
+
+    parts.push({ headerText: headerText, body: body });
+  }
+
+  return parts;
+}
+
+/**
+ * MIME headers, lowercased keys, with folded continuation lines joined.
+ */
+function parseMimeHeaders(headerText) {
+  const headers = {};
+  const lines = String(headerText || '').split(/\r?\n/);
+  let currentKey = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+
+    if (/^\s/.test(line) && currentKey) {
+      headers[currentKey] += ' ' + line.trim();
+      continue;
+    }
+
+    const match = line.match(/^([A-Za-z0-9-]+)\s*:\s*(.*)$/);
+    if (!match) continue;
+    currentKey = match[1].toLowerCase();
+    headers[currentKey] = match[2].trim();
+  }
+
+  return headers;
+}
+
+/**
+ * The filename from Content-Disposition, falling back to the Content-Type
+ * `name` parameter that older clients use.
+ */
+function mimeFileName(headers) {
+  const sources = [headers['content-disposition'] || '', headers['content-type'] || ''];
+
+  for (let i = 0; i < sources.length; i++) {
+    const source = sources[i];
+    const quoted = source.match(/(?:file)?name\s*=\s*"([^"]+)"/i);
+    if (quoted) return decodeMimeWord(quoted[1]);
+    const bare = source.match(/(?:file)?name\s*=\s*([^\s;]+)/i);
+    if (bare) return decodeMimeWord(bare[1]);
+    // RFC 2231 split/encoded form: filename*=UTF-8''invoice%20123.pdf
+    const extended = source.match(/(?:file)?name\*\s*=\s*[^']*'[^']*'([^\s;]+)/i);
+    if (extended) {
+      try { return decodeURIComponent(extended[1]); } catch (error) { return extended[1]; }
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Decode an RFC 2047 encoded-word ("=?UTF-8?B?...?=") filename.
+ */
+function decodeMimeWord(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/^=\?([^?]+)\?([BbQq])\?(.*)\?=$/);
+  if (!match) return text;
+
+  try {
+    if (match[2].toUpperCase() === 'B') {
+      return Utilities.newBlob(Utilities.base64Decode(match[3])).getDataAsString('UTF-8');
+    }
+    return match[3]
+      .replace(/_/g, ' ')
+      .replace(/=([0-9A-Fa-f]{2})/g, function(all, hex) {
+        return String.fromCharCode(parseInt(hex, 16));
+      });
+  } catch (error) {
+    return text;
+  }
+}
+
+/**
+ * Turn one encoded MIME part body into a Blob.
+ */
+function decodeMimePartToBlob(body, encoding, contentType, fileName) {
+  try {
+    if (encoding === 'base64') {
+      const cleaned = String(body || '').replace(/[^A-Za-z0-9+/=]/g, '');
+      if (!cleaned) return null;
+      return Utilities.newBlob(Utilities.base64Decode(cleaned), contentType, fileName);
+    }
+
+    if (encoding === 'quoted-printable') {
+      return Utilities.newBlob(decodeQuotedPrintable(body), contentType, fileName);
+    }
+
+    return Utilities.newBlob(String(body || ''), contentType, fileName);
+  } catch (error) {
+    Logger.log('Could not decode MIME part ' + fileName + ': ' + error.message);
+    return null;
+  }
+}
+
+function decodeQuotedPrintable(body) {
+  return String(body || '')
+    .replace(/=\r?\n/g, '')
+    .replace(/=([0-9A-Fa-f]{2})/g, function(all, hex) {
+      return String.fromCharCode(parseInt(hex, 16));
+    });
+}
+
+/**
+ * Present a Blob with the slice of the GmailAttachment API the pipeline uses.
+ */
+function wrapBlobAsAttachment(blob, contentType, fileName) {
+  return {
+    getName: function() { return fileName; },
+    getContentType: function() { return contentType; },
+    getSize: function() {
+      try { return blob.getBytes().length; } catch (error) { return 0; }
+    },
+    copyBlob: function() {
+      return Utilities.newBlob(blob.getBytes(), contentType, fileName);
+    },
+    getDataAsString: function() {
+      try { return blob.getDataAsString(); } catch (error) { return ''; }
+    }
+  };
+}
+
+/* ─── the Backup Catch lane ───────────────────────────────────────────────── */
+
+/**
+ * Search string for the catch label.
+ *
+ * Deliberately NOT folded into the main query: the whole point is that a
+ * message wearing this label is fetched even when the normal search would
+ * never have found it — wrong sender, wrong label, already read, older than the
+ * age limit. Callers run it as a second search and merge the results.
+ */
+function buildCatchLabelQuery(filters) {
+  const label = String((filters && filters.catchLabel) || '').trim();
+  if (!label) return '';
+  return 'label:' + quoteGmailTerm(label) + ' has:attachment';
+}
+
+/**
+ * Does this message carry the catch label?
+ * Gmail returns labels per thread, so a thread-level check is the honest one.
+ */
+function messageHasCatchLabel(message, filters) {
+  const wanted = String((filters && filters.catchLabel) || '').trim().toLowerCase();
+  if (!wanted) return false;
+
+  try {
+    const thread = message.getThread ? message.getThread() : null;
+    if (!thread) return false;
+    const labels = thread.getLabels() || [];
+    for (let i = 0; i < labels.length; i++) {
+      if (String(labels[i].getName() || '').toLowerCase() === wanted) {
+        return true;
+      }
+    }
+  } catch (error) {
+    Logger.log('Could not read thread labels: ' + error.message);
+  }
+  return false;
+}
+
+/**
+ * Take the catch label off once the message has been dealt with, so it does not
+ * come back on every run. Best effort — failing to remove it is not a reason to
+ * fail the invoice.
+ */
+function removeCatchLabel(message, filters) {
+  if (!filters || !filters.catchLabelRemoveAfterProcessing) return false;
+  const wanted = String(filters.catchLabel || '').trim();
+  if (!wanted) return false;
+
+  try {
+    const label = GmailApp.getUserLabelByName(wanted);
+    const thread = message.getThread ? message.getThread() : null;
+    if (label && thread) {
+      thread.removeLabel(label);
+      return true;
+    }
+  } catch (error) {
+    Logger.log('Could not remove the catch label: ' + error.message);
+  }
+  return false;
+}
+
+/**
+ * Merge the results of several Gmail searches, keeping each message once.
+ * Returns plain message objects rather than threads, because the catch-label
+ * search and the main search routinely overlap.
+ */
+function collectUniqueMessages(queries, perQueryLimit) {
+  const seen = {};
+  const messages = [];
+
+  for (let q = 0; q < queries.length; q++) {
+    const query = String(queries[q] || '').trim();
+    if (!query) continue;
+
+    let threads = [];
+    try {
+      threads = perQueryLimit
+        ? GmailApp.search(query, 0, perQueryLimit)
+        : GmailApp.search(query);
+    } catch (error) {
+      appendProcessingFeed('error', `Gmail search failed for "${query}"`, { error: error.message });
+      continue;
+    }
+
+    for (let t = 0; t < threads.length; t++) {
+      const threadMessages = threads[t].getMessages();
+      for (let m = 0; m < threadMessages.length; m++) {
+        const message = threadMessages[m];
+        const id = message.getId();
+        if (seen[id]) continue;
+        seen[id] = true;
+        messages.push(message);
+      }
+    }
+  }
+
+  return messages;
+}
+
+
 /* ─── forwarded-message unwrapping ────────────────────────────────────────── */
 
 const FORWARD_MARKER_PATTERN = /^\s*(?:-{2,}\s*(?:Forwarded message|Original Message)\s*-{2,}|Begin forwarded message:|_{10,})\s*$/i;
+const MAX_FORWARD_HOPS = 8;
 const FORWARD_SUBJECT_PREFIX_PATTERN = /^\s*(?:(?:re|fw|fwd|tr|aw|wg|vs)\s*(?:\[\d+\])?\s*:\s*)+/i;
 
 /**
@@ -1833,22 +2266,78 @@ function stripForwardPrefixes(subject) {
  * forwarding a carrier's mail, that is the carrier.
  */
 function parseForwardedEnvelope(body) {
+  const chain = parseForwardedEnvelopeChain(body);
+  return chain.length ? chain[0] : null;
+}
+
+/**
+ * Read EVERY forwarded envelope in a message body, outermost first.
+ *
+ * A manually forwarded invoice usually has two hops — the carrier mailed the
+ * delegated box, and a person then forwarded that on — which means the first
+ * envelope names the delegated mailbox, not the carrier. Callers need the whole
+ * chain to find the sender who actually issued the invoice.
+ */
+function parseForwardedEnvelopeChain(body) {
   const lines = String(body || '').split('\n');
-  const limit = Math.min(lines.length, 400);
+  const limit = Math.min(lines.length, 1200);
+  const chain = [];
+  let index = 0;
 
-  for (let i = 0; i < limit; i++) {
-    const isMarker = FORWARD_MARKER_PATTERN.test(lines[i]);
-    const startsHeaderBlock = /^\s*From:\s*\S/i.test(lines[i]);
-    if (!isMarker && !startsHeaderBlock) continue;
+  while (index < limit && chain.length < MAX_FORWARD_HOPS) {
+    const isMarker = FORWARD_MARKER_PATTERN.test(lines[index]);
+    const startsHeaderBlock = /^\s*From:\s*\S/i.test(lines[index]);
+    if (!isMarker && !startsHeaderBlock) {
+      index += 1;
+      continue;
+    }
 
-    const envelope = readEnvelopeHeaders(lines, isMarker ? i + 1 : i, limit);
-    if (envelope) {
-      return envelope;
+    const envelope = readEnvelopeHeaders(lines, isMarker ? index + 1 : index, limit);
+    if (!envelope) {
+      index += 1;
+      continue;
+    }
+
+    chain.push(envelope);
+    // Skip past the block we just consumed so its own header lines are not
+    // re-read as the start of the next hop.
+    index = (envelope.endIndex || index) + 1;
+  }
+
+  return chain;
+}
+
+/**
+ * Pick the envelope that names the party who actually sent the invoice.
+ *
+ * Walks the chain from the innermost hop outwards and takes the first sender
+ * that is not one of our own addresses — a delegated mailbox, or the operator
+ * who pressed Forward. Those are relays, not senders, and treating one as the
+ * sender is what made manually forwarded invoices unroutable.
+ */
+function selectOriginatingEnvelope(chain, internalAddresses) {
+  if (!chain || chain.length === 0) return null;
+
+  const internal = (internalAddresses || [])
+    .map(function(address) { return String(address || '').toLowerCase().trim(); })
+    .filter(Boolean);
+
+  const isInternal = function(value) {
+    const address = extractEmailAddress(value);
+    return !!address && internal.indexOf(address) >= 0;
+  };
+
+  for (let i = chain.length - 1; i >= 0; i--) {
+    if (!isInternal(chain[i].from)) {
+      return chain[i];
     }
   }
 
-  return null;
+  // Every hop was one of ours (an internal relay chain with no outside sender
+  // recoverable from the body) — the innermost is still the best guess.
+  return chain[chain.length - 1];
 }
+
 
 /**
  * Read From/To/Cc/Subject/Date out of a contiguous header block.
@@ -1856,7 +2345,7 @@ function parseForwardedEnvelope(body) {
  * does not register as a forward.
  */
 function readEnvelopeHeaders(lines, startIndex, limit) {
-  const envelope = { from: '', to: '', cc: '', subject: '', date: '' };
+  const envelope = { from: '', to: '', cc: '', subject: '', date: '', endIndex: startIndex };
   let seen = 0;
   let blankRun = 0;
 
@@ -1879,6 +2368,7 @@ function readEnvelopeHeaders(lines, startIndex, limit) {
 
     const key = match[1].toLowerCase();
     const value = match[2].trim();
+    envelope.endIndex = i;
     if (key === 'from' && !envelope.from) { envelope.from = value; seen += 1; }
     else if (key === 'to' && !envelope.to) { envelope.to = value; seen += 1; }
     else if (key === 'cc' && !envelope.cc) { envelope.cc = value; seen += 1; }
@@ -1942,12 +2432,19 @@ function buildMessageFilterContext(message, attachments, filters) {
   const originalSenderHeader = getMessageHeaderSafe(message, 'X-Original-Sender') ||
     getMessageHeaderSafe(message, 'X-Original-From');
 
-  const envelope = parseForwardedEnvelope(body);
+  // Follow the whole chain, not just the outermost hop: a manually forwarded
+  // invoice has the delegated mailbox at hop 1 and the carrier at hop 2.
+  const chain = parseForwardedEnvelopeChain(body);
 
   // Which delegated mailbox, if any, this reached us through.
   const delegatedCandidates = [from, to, cc, deliveredTo, forwardedForHeader]
     .map(extractEmailAddress)
     .filter(Boolean);
+  chain.forEach(function(hop) {
+    const hopFrom = extractEmailAddress(hop.from);
+    if (hopFrom) delegatedCandidates.push(hopFrom);
+  });
+
   let forwardedFrom = '';
   for (let i = 0; i < delegated.length && !forwardedFrom; i++) {
     if (delegatedCandidates.indexOf(delegated[i]) >= 0) {
@@ -1955,9 +2452,17 @@ function buildMessageFilterContext(message, attachments, filters) {
     }
   }
 
+  // Addresses that only ever relay: the delegated boxes and whoever runs this
+  // script (they are the one pressing Forward).
+  const internalAddresses = delegated.slice();
+  const owner = getScriptOwnerAddress();
+  if (owner) internalAddresses.push(owner);
+
+  const envelope = selectOriginatingEnvelope(chain, internalAddresses);
+
   const originalFrom = (envelope && envelope.from) || originalSenderHeader || '';
   const originalSubject = (envelope && envelope.subject) || stripForwardPrefixes(subject);
-  const isForwarded = !!envelope ||
+  const isForwarded = chain.length > 0 ||
     !!forwardedForHeader ||
     FORWARD_SUBJECT_PREFIX_PATTERN.test(subject);
 
@@ -1986,10 +2491,39 @@ function buildMessageFilterContext(message, attachments, filters) {
     effectiveFrom: effectiveFrom,
     effectiveFromAddress: extractEmailAddress(effectiveFrom),
     effectiveSubject: effectiveSubject,
+    hasCatchLabel: messageHasCatchLabel(message, filters),
     isForwarded: isForwarded,
     isDelegatedForward: !!forwardedFrom && isForwarded,
+    forwardHops: chain.length,
+    // True when a person forwarded this on by hand rather than a mail rule
+    // relaying it — the case the Backup Catch lane exists for.
+    isManualForward: chain.length > 1 || (chain.length === 1 && !!forwardedFrom && !deliveredToDelegated(deliveredTo, delegated)),
     attachmentNames: attachmentNames
   };
+}
+
+/**
+ * Was this delivered straight to a delegated mailbox (an automatic relay) as
+ * opposed to reaching us some other way?
+ */
+function deliveredToDelegated(deliveredTo, delegated) {
+  const address = extractEmailAddress(deliveredTo);
+  return !!address && (delegated || []).indexOf(address) >= 0;
+}
+
+/**
+ * The address running this script, cached per execution.
+ */
+function getScriptOwnerAddress() {
+  if (scriptOwnerCache !== null) {
+    return scriptOwnerCache;
+  }
+  try {
+    scriptOwnerCache = String(Session.getEffectiveUser().getEmail() || '').toLowerCase();
+  } catch (error) {
+    scriptOwnerCache = '';
+  }
+  return scriptOwnerCache;
 }
 
 /* ─── rule evaluation ─────────────────────────────────────────────────────── */
@@ -2080,6 +2614,17 @@ function evaluateEmailFilters(context, filters) {
 
   if (settings.enabled === false) {
     return { action: 'accept', reason: 'Filtering is turned off', rule: null };
+  }
+
+  // A person put the label there on purpose. That outranks every rule — the
+  // rules exist to guess, and this is someone who already knows.
+  if (context && context.hasCatchLabel && settings.catchLabelBypassesRules !== false) {
+    return {
+      action: 'accept',
+      reason: `Carries the "${settings.catchLabel}" label`,
+      rule: null,
+      viaCatchLabel: true
+    };
   }
 
   const rules = settings.rules || [];
@@ -2232,18 +2777,20 @@ function webTestEmailFilters(options) {
     const limit = Math.max(1, Math.min(Number(opts.limit) || 25, 100));
 
     const fetchQuery = buildGmailSearchQuery(filters.fetch);
+    const catchQuery = buildCatchLabelQuery(filters);
     const days = normalizeNewerThanDays(filters.fetch.newerThanDays) || 30;
     const query = opts.broad ? `has:attachment newer_than:${days}d` : fetchQuery;
 
-    const threads = GmailApp.search(query, 0, limit);
+    // Always include the catch lane, so a labelled message shows up here even
+    // when the main search would never have found it.
+    const messages = collectUniqueMessages([query, catchQuery], limit);
     const results = [];
     const counts = { accept: 0, skip: 0, review: 0, noAttachments: 0 };
 
-    for (let ti = 0; ti < threads.length && results.length < limit; ti++) {
-      const messages = threads[ti].getMessages();
+    {
       for (let mi = 0; mi < messages.length && results.length < limit; mi++) {
         const message = messages[mi];
-        const attachments = message.getAttachments().filter(isIngestibleInvoiceAttachment);
+        const attachments = gatherInvoiceAttachments(message);
 
         if (attachments.length === 0) {
           counts.noAttachments += 1;
@@ -2266,9 +2813,13 @@ function webTestEmailFilters(options) {
           forwardedFrom: context.forwardedFrom,
           isForwarded: context.isForwarded,
           isDelegatedForward: context.isDelegatedForward,
+          isManualForward: context.isManualForward,
+          forwardHops: context.forwardHops,
+          hasCatchLabel: context.hasCatchLabel,
           attachmentNames: context.attachmentNames,
           action: decision.action,
           reason: decision.reason,
+          viaCatchLabel: !!decision.viaCatchLabel,
           ruleId: decision.rule ? decision.rule.id : null,
           ruleName: decision.rule ? decision.rule.name : null
         });
@@ -2279,8 +2830,9 @@ function webTestEmailFilters(options) {
       ok: true,
       query: query,
       fetchQuery: fetchQuery,
+      catchQuery: catchQuery,
       broad: !!opts.broad,
-      threadsScanned: threads.length,
+      threadsScanned: messages.length,
       counts: counts,
       results: results
     };
@@ -2377,25 +2929,39 @@ function processIncomingPDFs() {
     summaryFilesCreated: 0,
     messagesMarkedRead: 0,
     filteredOut: 0,
-    queuedForReview: 0
+    queuedForReview: 0,
+    caughtByLabel: 0
   };
   const startedAt = Date.now();
   let handledCount = 0;
   let stoppedEarly = false;
 
-  const threads = GmailApp.search(searchQuery);
-  summary.threads = threads.length;
+  // Two lanes. The normal search finds what the rules expect; the catch-label
+  // search finds everything else a person flagged by hand, which is how a
+  // manual forward gets in — it is usually from the wrong sender, under a
+  // "Fwd:" subject, and may well already have been read.
+  const catchQuery = buildCatchLabelQuery(filters);
+  const messages = collectUniqueMessages([searchQuery, catchQuery]);
+
   summary.searchQuery = searchQuery;
-  appendProcessingFeed('info', `Gmail search: "${searchQuery}" → ${threads.length} thread(s) found`, { searchQuery: searchQuery, threadCount: threads.length });
+  summary.catchQuery = catchQuery;
+  summary.threads = messages.length;
+  appendProcessingFeed('info', `Gmail search: "${searchQuery}"${catchQuery ? ` + "${catchQuery}"` : ''} → ${messages.length} message(s) found`, {
+    searchQuery: searchQuery,
+    catchQuery: catchQuery,
+    messageCount: messages.length
+  });
 
-  for (let ti = 0; ti < threads.length; ti++) {
-    if (stoppedEarly) break;
-    const messages = threads[ti].getMessages();
-
+  {
     for (let mi = 0; mi < messages.length; mi++) {
       if (stoppedEarly) break;
       const message = messages[mi];
-      if (!message.isUnread()) {
+      const carriesCatchLabel = messageHasCatchLabel(message, filters);
+
+      // Unread is the normal signal that a message still needs work, but a
+      // hand-applied catch label overrides it — people label things they have
+      // already opened.
+      if (!message.isUnread() && !carriesCatchLabel) {
         continue;
       }
 
@@ -2407,8 +2973,21 @@ function processIncomingPDFs() {
       }
 
       summary.unreadMessages += 1;
-      const invoiceAttachments = message.getAttachments().filter(isIngestibleInvoiceAttachment);
+      if (carriesCatchLabel) {
+        summary.caughtByLabel += 1;
+      }
+
+      const invoiceAttachments = gatherInvoiceAttachments(message);
       if (invoiceAttachments.length === 0) {
+        if (carriesCatchLabel) {
+          // Someone labelled this expecting it to be picked up; saying nothing
+          // would look exactly like the tool ignoring them.
+          appendProcessingFeed('warning', `"${message.getSubject()}" carries the ${filters.catchLabel} label but has no invoice attachment.`, {
+            from: message.getFrom(),
+            subject: message.getSubject()
+          });
+          removeCatchLabel(message, filters);
+        }
         message.markRead();
         summary.messagesMarkedRead += 1;
         continue;
@@ -2420,6 +2999,15 @@ function processIncomingPDFs() {
       // relayed it — which is the only way to tell inbound from outbound here.
       const filterContext = buildMessageFilterContext(message, invoiceAttachments, filters);
       const decision = evaluateEmailFilters(filterContext, filters);
+
+      if (decision.viaCatchLabel) {
+        appendProcessingFeed('info', `Caught by the ${filters.catchLabel} label: "${filterContext.effectiveSubject}"`, {
+          from: filterContext.from,
+          effectiveFrom: filterContext.effectiveFrom,
+          forwardHops: filterContext.forwardHops,
+          isManualForward: filterContext.isManualForward
+        });
+      }
 
       if (decision.action === 'skip') {
         summary.filteredOut += 1;
@@ -2446,6 +3034,9 @@ function processIncomingPDFs() {
         if (queued.ok) {
           message.markRead();
           summary.messagesMarkedRead += 1;
+          if (carriesCatchLabel) {
+            removeCatchLabel(message, filters);
+          }
         }
         continue;
       }
@@ -2560,6 +3151,11 @@ function processIncomingPDFs() {
       if (canMarkRead) {
         message.markRead();
         summary.messagesMarkedRead += 1;
+        // Clear the label so the next run does not pick this up again: the
+        // catch-label search deliberately ignores read/unread.
+        if (carriesCatchLabel) {
+          removeCatchLabel(message, filters);
+        }
       }
     }
   }

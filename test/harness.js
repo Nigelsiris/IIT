@@ -26,15 +26,19 @@ function buildSandbox() {
         .replace('yyyy', date.getFullYear());
     },
     newBlob: (content, type, name) => {
+      // Real Blobs hold bytes, so keep Buffers as Buffers — base64Decode output
+      // is fed straight back into newBlob by the .eml parser.
+      const bytes = Buffer.isBuffer(content) ? content : Buffer.from(String(content));
       const blob = {
         content,
         getName() { return name; },
         getContentType() { return type; },
         setName(n) { name = n; return blob; },
         setContentType(t) { type = t; return blob; },
-        getBytes() { return Buffer.from(String(content)); },
-        copyBlob() { return Utilities.newBlob(content, type, name); },
-        getAs(target) { return Utilities.newBlob(content, target, name); }
+        getBytes() { return bytes; },
+        getDataAsString(charset) { return bytes.toString(charset ? 'utf8' : 'utf8'); },
+        copyBlob() { return Utilities.newBlob(bytes, type, name); },
+        getAs(target) { return Utilities.newBlob(bytes, target, name); }
       };
       return blob;
     },

@@ -1220,6 +1220,47 @@
             </div>
           </div>
 
+          <div class="card" style="margin-bottom:16px;">
+            <div class="card-header">
+              <h2>Backup Catch</h2>
+              <span class="badge badge-success">Manual override</span>
+            </div>
+            <div class="card-body">
+              <p style="font-size:13px;line-height:1.7;color:var(--text-secondary);margin:0 0 12px;">
+                Put this label on any message in Gmail and it gets processed &mdash; even if it is
+                already read, older than the age limit below, from an unexpected sender, or caught
+                by a Skip rule. It is the escape hatch for anything the rules cannot anticipate,
+                and the reliable way to push through a message you forwarded by hand.
+              </p>
+              <div class="grid-2">
+                <div class="form-group">
+                  <label class="form-label">Label Name</label>
+                  <input id="fltCatchLabel" type="text" class="form-input" placeholder="Backup Catch" oninput="renderFilterQueryPreview()" />
+                  <div class="form-hint">Leave blank to turn the lane off. The label must already exist in Gmail.</div>
+                </div>
+                <div class="form-group">
+                  <label class="form-label">Behaviour</label>
+                  <label class="form-check" style="margin-bottom:6px;">
+                    <input type="checkbox" id="fltCatchBypass" />
+                    Ignore the rules for labelled messages
+                  </label>
+                  <label class="form-check">
+                    <input type="checkbox" id="fltCatchRemove" />
+                    Remove the label once processed
+                  </label>
+                  <div class="form-hint">
+                    Removing it stops the same message being picked up every run, since this lane
+                    deliberately ignores read/unread.
+                  </div>
+                </div>
+              </div>
+              <div class="form-group" style="margin-bottom:0;">
+                <label class="form-label">Extra Gmail Search</label>
+                <div class="query-preview" id="fltCatchQueryPreview">&mdash;</div>
+              </div>
+            </div>
+          </div>
+
           <div class="grid-2" style="margin-bottom:16px;">
             <div class="card">
               <div class="card-header"><h2>What to Pull from Gmail</h2></div>
@@ -2365,6 +2406,9 @@
       if (!filters) return;
 
       setChecked('fltEnabled', filters.enabled !== false);
+      setValue('fltCatchLabel', filters.catchLabel || '');
+      setChecked('fltCatchBypass', filters.catchLabelBypassesRules !== false);
+      setChecked('fltCatchRemove', filters.catchLabelRemoveAfterProcessing !== false);
       setValue('fltDelegated', listToLines(filters.delegatedMailboxes));
       setValue('fltMode', filters.fetch.mode || 'builder');
       setChecked('fltHasAttachment', filters.fetch.hasAttachment !== false);
@@ -2471,6 +2515,9 @@
       var current = state.filters || {};
       return {
         enabled: getChecked('fltEnabled'),
+        catchLabel: getValue('fltCatchLabel'),
+        catchLabelBypassesRules: getChecked('fltCatchBypass'),
+        catchLabelRemoveAfterProcessing: getChecked('fltCatchRemove'),
         delegatedMailboxes: linesToList(getValue('fltDelegated')),
         defaultAction: getValue('fltDefaultAction'),
         markRejectedRead: getChecked('fltMarkRejectedRead'),
@@ -2492,8 +2539,16 @@
 
     /* Preview the query locally so it updates as you type, without a round trip. */
     function renderFilterQueryPreview() {
-      var fetchSettings = collectFilters().fetch;
-      document.getElementById('fltQueryPreview').textContent = buildQueryPreview(fetchSettings);
+      var current = collectFilters();
+      document.getElementById('fltQueryPreview').textContent = buildQueryPreview(current.fetch);
+
+      var catchPreview = document.getElementById('fltCatchQueryPreview');
+      if (catchPreview) {
+        var label = String(current.catchLabel || '').trim();
+        catchPreview.textContent = label
+          ? 'label:' + (/[\s()"]/.test(label) ? '"' + label.replace(/"/g, '') + '"' : label) + ' has:attachment'
+          : '(off — no label set)';
+      }
     }
 
     function buildQueryPreview(fetchSettings) {
@@ -2675,12 +2730,14 @@
       };
 
       var rows = result.results.map(function(item) {
+        var hopNote = item.forwardHops > 1 ? ' (' + item.forwardHops + ' hops)' : '';
         var forwardNote = item.isDelegatedForward
-          ? '<div style="font-size:11px;color:var(--text-muted);">via ' + escapeHtml(item.forwardedFrom) + '</div>'
-          : (item.isForwarded ? '<div style="font-size:11px;color:var(--text-muted);">forwarded</div>' : '');
+          ? '<div style="font-size:11px;color:var(--text-muted);">via ' + escapeHtml(item.forwardedFrom) + hopNote + '</div>'
+          : (item.isForwarded ? '<div style="font-size:11px;color:var(--text-muted);">forwarded' + hopNote + '</div>' : '');
 
         return '<tr>' +
-          '<td>' + (badgeFor[item.action] || escapeHtml(item.action)) + '</td>' +
+          '<td>' + (badgeFor[item.action] || escapeHtml(item.action)) +
+            (item.viaCatchLabel ? '<div style="margin-top:4px;"><span class="badge badge-info">Caught</span></div>' : '') + '</td>' +
           '<td>' + escapeHtml(item.effectiveSubject || item.subject) +
             (item.effectiveSubject !== item.subject
               ? '<div style="font-size:11px;color:var(--text-muted);">arrived as: ' + escapeHtml(item.subject) + '</div>'

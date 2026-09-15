@@ -37,6 +37,11 @@ function makeMessage(fields) {
     getId: () => f.id || 'msg-1',
     isUnread: () => f.unread !== false,
     markRead() { f.markedRead = true; },
+    _fields: f,
+    getThread: () => ({
+      getLabels: () => (f.labels || []).map(name => ({ getName: () => name })),
+      removeLabel(label) { f.removedLabel = label.getName(); }
+    }),
     getAttachments: () => (f.attachmentNames || []).map(name => ({
       getName: () => name,
       getContentType: () => 'application/pdf',
@@ -412,10 +417,15 @@ group('gmail ingestion wiring', () => {
   };
   S.SpreadsheetApp = { openById: () => ({ getSheetByName: () => sheet, insertSheet: () => sheet }) };
 
-  let searched = null;
+  const searched = [];
   const sentMail = [];
   S.GmailApp = {
-    search: query => { searched = query; return [{ getMessages: () => [inbound, outbound] }]; },
+    search: query => {
+      searched.push(query);
+      // Only the main lane returns mail here; the catch lane is covered below.
+      return query.indexOf('label:') === 0 ? [] : [{ getMessages: () => [inbound, outbound] }];
+    },
+    getUserLabelByName: () => null,
     getUserLabels: () => [],
     getAliases: () => [],
     sendEmail: (to, subject, body, options) => sentMail.push({ to, subject, body, options })
@@ -426,7 +436,8 @@ group('gmail ingestion wiring', () => {
   S.clearEmailFiltersCache();
   const summary = S.processIncomingPDFs();
 
-  check('query came from the filters', searched, S.buildGmailSearchQuery(S.getEmailFilters().fetch));
+  check('main query came from the filters', searched[0], S.buildGmailSearchQuery(S.getEmailFilters().fetch));
+  check('catch lane searched too', searched[1], 'label:"Backup Catch" has:attachment');
   check('both messages seen', summary.unreadMessages, 2);
   // The outbound forward is rejected on the ORIGINAL subject, which native
   // Gmail filters cannot see at all.
@@ -436,6 +447,116 @@ group('gmail ingestion wiring', () => {
   check('logged the inbound invoice', appendedRows[0][3], 'INV6744248');
   // Skipped mail stays unread by default so a bad rule is easy to spot.
   check('skipped message left unread', outbound.markedRead === undefined || outbound.markedRead === false, true);
+});
+
+/* ─── a hand-forwarded, labelled message makes it all the way through ─────── */
+group('Backup Catch end to end', () => {
+  // Read, from the operator's own address, subject the rules do not like, and
+  // outside the main search entirely — i.e. everything that made manual
+  // forwards fail. The label is the only reason it gets in.
+  const manual = makeMessage({
+    id: 'm-manual',
+    from: 'Nigel <nigel@lidl.us>',
+    to: 'Nigel <nigel@lidl.us>',
+    subject: 'Fwd: Fwd: paperwork',
+    unread: false,
+    labels: ['Backup Catch'],
+    body: [
+      '---------- Forwarded message ---------',
+      'From: Logistics Invoices <logistics.invoices@lidl.us>',
+      'Subject: Fwd: paperwork',
+      'To: Nigel <nigel@lidl.us>',
+      '',
+      '---------- Forwarded message ---------',
+      'From: Arrive Billing <billing@arrivelogistics.com>',
+      'Subject: Invoice INV6744248',
+      'To: <logistics.invoices@lidl.us>'
+    ].join('\n'),
+    attachmentNames: ['invoice-INV6744248.pdf']
+  });
+
+  const store = {
+    EMAIL_FILTERS: JSON.stringify(S.normalizeEmailFilters({
+      delegatedMailboxes: ['logistics.invoices@lidl.us'],
+      catchLabel: 'Backup Catch',
+      defaultAction: 'skip',
+      rules: [
+        { id: 'r1', name: 'Skip everything else', action: 'reject', field: 'any', operator: 'contains', value: 'paperwork' }
+      ]
+    })),
+    SHEET_ID: 'sheet-id',
+    SHEET_NAME: 'Invoice Logger Catch',
+    TARGET_EMAIL: 'ap@example.com',
+    PROCESSED_FOLDER_ID: 'processed-id',
+    SOURCE_FOLDER_IDS: 'source-id'
+  };
+
+  S.PropertiesService = {
+    getScriptProperties: () => ({
+      getProperty: key => (key in store ? store[key] : null),
+      setProperty: (key, value) => { store[key] = value; },
+      deleteProperty: key => { delete store[key]; },
+      getProperties: () => Object.assign({}, store)
+    })
+  };
+  S.LockService = { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) };
+  S.DriveApp = { getFolderById: () => ({ getName: () => 'Processed', createFile: () => ({}) }), getFileById: () => ({ setTrashed() {} }) };
+  S.Drive = { Files: { create: () => ({ id: 'temp-doc-id' }), get: () => ({ mimeType: 'application/vnd.google-apps.spreadsheet' }) } };
+  S.DocumentApp = {
+    openById: () => ({
+      getBody: () => ({
+        getText: () => [
+          'Arrive Logistics',
+          'Invoice # INV6744248',
+          'Destination Address',
+          'Perryville, Maryland 21903',
+          'Amount Due $2,700.00'
+        ].join('\n')
+      })
+    })
+  };
+  S.Session = { getEffectiveUser: () => ({ getEmail: () => 'nigel@lidl.us' }), getScriptTimeZone: () => 'UTC' };
+  S.ScriptApp = { getOAuthToken: () => 'token' };
+  S.UrlFetchApp = { fetch: () => ({ getResponseCode: () => 500, getBlob: () => null }) };
+
+  const appendedRows = [];
+  const sheet = {
+    getMaxColumns: () => 26,
+    insertColumnsAfter() {},
+    getRange: () => ({ getValues: () => [S.LOG_HEADERS.slice()], setValues() {} }),
+    appendRow: row => appendedRows.push(row)
+  };
+  S.SpreadsheetApp = { openById: () => ({ getSheetByName: () => sheet, insertSheet: () => sheet }) };
+
+  let removedLabel = null;
+  const queries = [];
+  S.GmailApp = {
+    search: (query) => {
+      queries.push(query);
+      // The main search does NOT return it — only the catch lane does.
+      return query.indexOf('label:"Backup Catch"') === 0 ? [{ getMessages: () => [manual] }] : [];
+    },
+    getUserLabels: () => [],
+    getUserLabelByName: name => ({ getName: () => name }),
+    getAliases: () => [],
+    sendEmail() {}
+  };
+  S.clearSendAsAliasCache();
+  S.clearEmailFiltersCache();
+  S.scriptOwnerCache = null;
+
+  const summary = S.processIncomingPDFs();
+
+  check('catch lane was searched', queries.indexOf('label:"Backup Catch" has:attachment') >= 0, true);
+  check('counted as caught', summary.caughtByLabel, 1);
+  // Already read, and a Skip rule matches — neither stopped it.
+  check('processed anyway', summary.processed, 1);
+  check('not filtered out', summary.filteredOut, 0);
+  check('logged', appendedRows.length, 1);
+  check('carrier resolved through both hops', appendedRows[0][3], 'INV6744248');
+  // Label removed so the next run does not pick it up again — this lane
+  // deliberately ignores read/unread, so without it the message never settles.
+  check('label cleared', manual._fields.removedLabel, 'Backup Catch');
 });
 
 /* ─── the batch limit must cover filtered messages too ────────────────────── */
@@ -489,6 +610,207 @@ group('run budget', () => {
 
   check('stopped at the batch limit', summary.stoppedEarly, true);
   check('did not queue the whole mailbox', summary.queuedForReview <= S.MAX_INVOICES_PER_RUN, true);
+});
+
+/* ─── multi-hop: a person forwards an already-forwarded invoice ───────────── */
+group('manual forward through the delegated box', () => {
+  S.Session = { getEffectiveUser: () => ({ getEmail: () => 'nigel@lidl.us' }) };
+  S.scriptOwnerCache = null;
+
+  const filters = S.normalizeEmailFilters({
+    delegatedMailboxes: ['logistics.invoices@lidl.us']
+  });
+
+  // Carrier -> delegated box -> Nigel forwards it to himself. Two envelopes.
+  const twoHop = contextFor({
+    from: 'Nigel <nigel@lidl.us>',
+    to: 'Nigel <nigel@lidl.us>',
+    subject: 'Fwd: Fwd: Invoice INV6744248',
+    body: [
+      'Please process this one.',
+      '',
+      '---------- Forwarded message ---------',
+      'From: Logistics Invoices <logistics.invoices@lidl.us>',
+      'Date: Mon, Apr 6, 2026 at 10:02 AM',
+      'Subject: Fwd: Invoice INV6744248',
+      'To: Nigel <nigel@lidl.us>',
+      '',
+      '---------- Forwarded message ---------',
+      'From: Arrive Billing <billing@arrivelogistics.com>',
+      'Date: Mon, Apr 6, 2026 at 9:15 AM',
+      'Subject: Invoice INV6744248 - Inbound Load 8523482',
+      'To: <logistics.invoices@lidl.us>',
+      '',
+      'Please find attached.'
+    ].join('\n'),
+    attachmentNames: ['invoice-INV6744248.pdf']
+  }, filters);
+
+  check('both hops parsed', twoHop.forwardHops, 2);
+  // Taking the FIRST envelope would give the delegated mailbox — the bug that
+  // made hand-forwarded invoices unroutable.
+  check('resolves past both relays', twoHop.effectiveFromAddress, 'billing@arrivelogistics.com');
+  check('original subject from the deepest hop', twoHop.effectiveSubject, 'Invoice INV6744248 - Inbound Load 8523482');
+  check('delegated box still identified', twoHop.forwardedFrom, 'logistics.invoices@lidl.us');
+  check('recognised as a manual forward', twoHop.isManualForward, true);
+
+  // The operator's own address is a relay too, never the sender.
+  const selfForward = contextFor({
+    from: 'Nigel <nigel@lidl.us>',
+    subject: 'Fwd: Invoice 9001',
+    body: [
+      '---------- Forwarded message ---------',
+      'From: Nigel <nigel@lidl.us>',
+      'Subject: Fwd: Invoice 9001',
+      'To: Nigel <nigel@lidl.us>',
+      '',
+      '---------- Forwarded message ---------',
+      'From: Speedy Freight <ar@speedyfreight.com>',
+      'Subject: Invoice 9001',
+      'To: <logistics.invoices@lidl.us>'
+    ].join('\n'),
+    attachmentNames: ['inv.pdf']
+  }, filters);
+  check('skips the operator as a sender', selfForward.effectiveFromAddress, 'ar@speedyfreight.com');
+
+  // A rule on the carrier domain now matches a hand-forwarded invoice.
+  const byDomain = S.normalizeEmailFilters({
+    delegatedMailboxes: ['logistics.invoices@lidl.us'],
+    defaultAction: 'skip',
+    rules: [{ id: 'r1', name: 'Arrive', action: 'accept', field: 'effectiveFrom', operator: 'domainIs', value: 'arrivelogistics.com' }]
+  });
+  check('domain rule matches through two hops', S.evaluateEmailFilters(twoHop, byDomain).action, 'accept');
+});
+
+/* ─── the Backup Catch label ──────────────────────────────────────────────── */
+group('Backup Catch label', () => {
+  const filters = S.normalizeEmailFilters({
+    catchLabel: 'Backup Catch',
+    defaultAction: 'skip',
+    rules: [
+      { id: 'r1', name: 'Skip outbound', action: 'reject', field: 'effectiveSubject', operator: 'contains', value: 'outbound' }
+    ]
+  });
+
+  check('default label name', S.DEFAULT_EMAIL_FILTERS.catchLabel, 'Backup Catch');
+  check('catch query built', S.buildCatchLabelQuery(filters), 'label:"Backup Catch" has:attachment');
+  check('no label means no catch query', S.buildCatchLabelQuery(S.normalizeEmailFilters({ catchLabel: '' })), '');
+
+  const labelled = makeMessage({
+    from: 'Nigel <nigel@lidl.us>',
+    subject: 'Fwd: Outbound load 4471',
+    body: 'no keywords the rules like',
+    labels: ['Backup Catch'],
+    attachmentNames: ['doc.pdf']
+  });
+  check('label detected', S.messageHasCatchLabel(labelled, filters), true);
+
+  const labelledContext = S.buildMessageFilterContext(labelled, labelled.getAttachments(), filters);
+  const decision = S.evaluateEmailFilters(labelledContext, filters);
+  // The subject says "outbound", which the rule above rejects — the label wins.
+  check('label beats a reject rule', decision.action, 'accept');
+  check('reason names the label', decision.reason, 'Carries the "Backup Catch" label');
+  check('flagged as caught', decision.viaCatchLabel, true);
+
+  // Unlabelled, the same message is skipped.
+  const plain = makeMessage({
+    from: 'Nigel <nigel@lidl.us>',
+    subject: 'Fwd: Outbound load 4471',
+    body: 'no keywords the rules like',
+    attachmentNames: ['doc.pdf']
+  });
+  const plainContext = S.buildMessageFilterContext(plain, plain.getAttachments(), filters);
+  check('without the label it is skipped', S.evaluateEmailFilters(plainContext, filters).action, 'skip');
+
+  // The bypass can be turned off without giving up the extra search lane.
+  const noBypass = S.normalizeEmailFilters({
+    catchLabel: 'Backup Catch',
+    catchLabelBypassesRules: false,
+    defaultAction: 'skip',
+    rules: [{ id: 'r1', name: 'Skip outbound', action: 'reject', field: 'effectiveSubject', operator: 'contains', value: 'outbound' }]
+  });
+  const noBypassContext = S.buildMessageFilterContext(labelled, labelled.getAttachments(), noBypass);
+  check('bypass can be disabled', S.evaluateEmailFilters(noBypassContext, noBypass).action, 'skip');
+});
+
+/* ─── forward as attachment (.eml) ────────────────────────────────────────── */
+group('forward as attachment', () => {
+  const pdfBase64 = Buffer.from('%PDF-1.4 fake invoice bytes').toString('base64');
+  const eml = [
+    'From: Arrive Billing <billing@arrivelogistics.com>',
+    'To: logistics.invoices@lidl.us',
+    'Subject: Invoice INV6744248',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="BOUND1"',
+    '',
+    '--BOUND1',
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: 7bit',
+    '',
+    'Invoice attached.',
+    '',
+    '--BOUND1',
+    'Content-Type: application/pdf; name="invoice-INV6744248.pdf"',
+    'Content-Disposition: attachment; filename="invoice-INV6744248.pdf"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    pdfBase64,
+    '',
+    '--BOUND1--',
+    ''
+  ].join('\r\n');
+
+  const found = S.parseEmlAttachments(eml, 0);
+  check('invoice found inside the .eml', found.length, 1);
+  check('name preserved', found[0].getName(), 'invoice-INV6744248.pdf');
+  check('type preserved', found[0].getContentType(), 'application/pdf');
+  check('bytes decoded', found[0].copyBlob().getDataAsString().indexOf('%PDF-1.4') , 0);
+  // The text part is not an invoice and must not come through.
+  check('text part ignored', found.filter(a => a.getName() === '').length, 0);
+
+  // An .eml with no attachments yields nothing rather than throwing.
+  const emptyEml = [
+    'From: a@b.com',
+    'Content-Type: multipart/mixed; boundary="X"',
+    '',
+    '--X',
+    'Content-Type: text/plain',
+    '',
+    'nothing here',
+    '--X--'
+  ].join('\r\n');
+  check('no attachments', S.parseEmlAttachments(emptyEml, 0).length, 0);
+  check('garbage is survivable', S.parseEmlAttachments('not a message at all', 0).length, 0);
+  check('empty input', S.parseEmlAttachments('', 0).length, 0);
+
+  // Encoded filenames and the older Content-Type name= form.
+  check('encoded-word filename', S.decodeMimeWord('=?UTF-8?B?' + Buffer.from('facture réf.pdf').toString('base64') + '?='), 'facture réf.pdf');
+  check('quoted-printable filename', S.decodeMimeWord('=?UTF-8?Q?invoice=5F1.pdf?='), 'invoice_1.pdf');
+  check('plain filename untouched', S.decodeMimeWord('invoice.pdf'), 'invoice.pdf');
+
+  check('eml detected by extension', S.isEmlAttachment({ getName: () => 'forwarded.eml', getContentType: () => 'application/octet-stream' }), true);
+  check('eml detected by type', S.isEmlAttachment({ getName: () => 'noext', getContentType: () => 'message/rfc822' }), true);
+  check('pdf is not an eml', S.isEmlAttachment({ getName: () => 'a.pdf', getContentType: () => 'application/pdf' }), false);
+
+  // gatherInvoiceAttachments pulls both loose invoices and nested ones.
+  const message = {
+    getAttachments: () => [
+      {
+        getName: () => 'direct.pdf',
+        getContentType: () => 'application/pdf',
+        getSize: () => 10,
+        copyBlob: () => S.Utilities.newBlob('x', 'application/pdf', 'direct.pdf')
+      },
+      {
+        getName: () => 'forwarded.eml',
+        getContentType: () => 'message/rfc822',
+        getSize: () => eml.length,
+        copyBlob: () => S.Utilities.newBlob(eml, 'message/rfc822', 'forwarded.eml')
+      }
+    ]
+  };
+  const gathered = S.gatherInvoiceAttachments(message);
+  check('both sources gathered', gathered.map(a => a.getName()), ['direct.pdf', 'invoice-INV6744248.pdf']);
 });
 
 /* ─── report ──────────────────────────────────────────────────────────────── */

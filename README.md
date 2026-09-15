@@ -8,7 +8,8 @@ Google Apps Script automation for inbound freight invoices — PDFs, Excel workb
 - Unpacks zip archives (including nested ones) into their individual invoices before processing
 - OCRs and extracts invoice metadata
 - Supports manual extraction mapping profiles for hard-to-parse invoice formats (like Arrive)
-- Separates inbound from outbound mail forwarded by a delegated mailbox, by reading the original sender/subject out of the forward
+- Separates inbound from outbound mail forwarded by a delegated mailbox, by reading the original sender/subject out of the forward (including hand-forwarded, multi-hop and forwarded-as-attachment mail)
+- Provides a **Backup Catch** label as a manual override for anything the rules cannot anticipate
 - Applies routing/coding rules
 - Logs to a Google Sheet
 - Reads spreadsheet invoices as data, including workbooks holding **many invoices, one per line**
@@ -174,7 +175,22 @@ available to rules:
 | `deliveredTo`, `replyTo`, `cc`, `forwardedFrom` | Routing, including which delegated box relayed it |
 | `body`, `attachmentName`, `any` | Full text, each attachment name, everything at once |
 
-### 2. Rules decide, top to bottom
+### 2. Multi-hop forwards are followed to the end
+
+An invoice that a person forwards on by hand has **two** envelopes in it — the
+delegated mailbox at hop 1, the carrier at hop 2:
+
+```
+Arrive Billing  →  logistics.invoices@lidl.us  →  (you forward it)  →  your inbox
+```
+
+The chain is walked from the innermost hop outwards, and the first sender that
+is **not** one of your own addresses (a delegated mailbox, or the account
+running the script) is taken as the originator. Stopping at hop 1 would resolve
+every hand-forwarded invoice to the delegated mailbox, which is why they were
+unroutable.
+
+### 3. Rules decide, top to bottom
 
 Rules are checked in order and **the first one that matches wins** — nothing
 below it is considered. Each rule is an action (Process / Skip), a field, a test
@@ -196,6 +212,38 @@ guess. It can be set to Process or Skip instead.
 
 Skipped messages are left **unread** by default, so a rule that is too broad is
 easy to notice and undo.
+
+### Backup Catch — the manual override
+
+Some messages will never match any rule: you forwarded them by hand, they came
+from an unexpected address, they sat in the mailbox until they were read, or the
+subject says nothing useful. Put the **Backup Catch** label on them in Gmail and
+they get processed.
+
+The label is a second, independent search lane. A message wearing it is picked
+up even when it is:
+
+- already **read** (the normal search only looks at unread mail)
+- **older** than the age limit
+- from a sender or under a label the search never covers
+- matched by a **Skip** rule — the label outranks every rule, because a person
+  put it there on purpose
+
+The label is removed once the message has been dealt with, so it does not come
+back on every run. Both behaviours are toggles on the Email Filters tab, and the
+label name is editable — blank turns the lane off.
+
+If a labelled message turns out to have no invoice attachment, that is called
+out in the activity feed rather than silently ignored.
+
+### Forward as attachment (.eml)
+
+Gmail's "Forward as attachment", and dragging a message into a new one in
+Outlook, wrap the original in a `message/rfc822` part instead of quoting it —
+so the invoice is an attachment inside an attachment, and the outer message
+looks empty. Those are now opened: the MIME parts are walked, nested forwards
+followed up to three levels, and any PDF, spreadsheet or zip inside is processed
+as if it had been attached directly.
 
 ### Choosing what Gmail returns
 
